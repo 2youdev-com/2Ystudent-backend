@@ -1,0 +1,934 @@
+/**
+ * AI Teacher Controller
+ *
+ * REST API endpoints for the AI Teacher feature.
+ */
+
+import { Router, Request, Response, NextFunction } from 'express';
+import { injectable, inject } from 'tsyringe';
+import { AITeacherService } from '../services/ai-teacher/ai-teacher.service';
+import { AVContentService } from '../services/av-content/av-content.service';
+import { authMiddleware } from '../middleware/auth.middleware';
+import { isValidTeacherName, isValidVoiceName } from '../services/ai-teacher/teacher-personas.config';
+import multer, { FileFilterCallback } from 'multer';
+
+// Extend Request type to include file property
+interface MulterRequest extends Request {
+  file?: Express.Multer.File;
+  files?: Express.Multer.File[] | { [fieldname: string]: Express.Multer.File[] };
+}
+
+// Configure multer for file uploads (single and multiple)
+const uploadConfig = {
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 25 * 1024 * 1024, // 25MB max per file
+    files: 5, // Max 5 files at once
+  },
+  fileFilter: (req: Request, file: Express.Multer.File, cb: FileFilterCallback) => {
+    // Allow specific file types including images and presentations
+    const allowedTypes = [
+      // Documents
+      'application/pdf',
+      'text/plain',
+      'application/json',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      // PowerPoint
+      'application/vnd.ms-powerpoint',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      // Images
+      'image/jpeg',
+      'image/png',
+      'image/gif',
+      'image/webp',
+      'image/svg+xml',
+    ];
+
+    // Also allow any image type
+    if (allowedTypes.includes(file.mimetype) || file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error(`File type ${file.mimetype} not allowed. Allowed types: PDF, Word, PowerPoint, images, text.`));
+    }
+  },
+};
+
+const upload = multer(uploadConfig);
+const uploadMultiple = multer(uploadConfig).array('files', 5);
+
+// Configure multer for audio uploads
+const audioUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 25 * 1024 * 1024, // 25MB max for audio
+  },
+  fileFilter: (req: Request, file: Express.Multer.File, cb: FileFilterCallback) => {
+    // Allow audio file types
+    const allowedTypes = [
+      'audio/webm',
+      'audio/wav',
+      'audio/mp3',
+      'audio/mpeg',
+      'audio/ogg',
+      'audio/mp4',
+      'audio/m4a',
+    ];
+    if (allowedTypes.includes(file.mimetype) || file.mimetype.startsWith('audio/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Audio file type not allowed'));
+    }
+  },
+});
+
+@injectable()
+export class AITeacherController {
+  public router: Router;
+
+  constructor(
+    @inject(AITeacherService) private aiTeacherService: AITeacherService,
+    @inject(AVContentService) private avContentService: AVContentService
+  ) {
+    this.router = Router();
+    this.initializeRoutes();
+  }
+
+  private initializeRoutes(): void {
+    // Profile endpoints
+    this.router.get(
+      '/profile',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.getProfile.bind(this)
+    );
+
+    this.router.patch(
+      '/profile',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.updateProfile.bind(this)
+    );
+
+    this.router.post(
+      '/profile/sync',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.syncProfile.bind(this)
+    );
+
+    // Chat endpoints
+    this.router.get(
+      '/welcome',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.getWelcome.bind(this)
+    );
+
+    this.router.post(
+      '/chat',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.sendMessage.bind(this)
+    );
+
+    // Streaming chat endpoint for real-time responses
+    this.router.post(
+      '/chat/stream',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.sendMessageStream.bind(this)
+    );
+
+    this.router.get(
+      '/history',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.getHistory.bind(this)
+    );
+
+    // Assigned teacher endpoint
+    this.router.get(
+      '/assigned-teacher',
+      authMiddleware(['student']),
+      this.getAssignedTeacher.bind(this)
+    );
+
+    // Get teacher info by name (for displaying avatar, names, etc)
+    this.router.get(
+      '/teacher-info/:name',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.getTeacherInfo.bind(this)
+    );
+
+    // Voice endpoints
+    this.router.post(
+      '/tts',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.textToSpeech.bind(this)
+    );
+
+    // Pre-render TTS for streaming - generates audio for first sentence quickly
+    this.router.post(
+      '/tts/prerender',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.preRenderTTS.bind(this)
+    );
+
+    // Welcome audio for teacher persona (instant pre-defined message)
+    this.router.get(
+      '/tts/welcome',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.getWelcomeAudio.bind(this)
+    );
+
+    this.router.post(
+      '/stt',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      audioUpload.single('audio'),
+      this.speechToText.bind(this)
+    );
+
+    // File upload endpoint (single file)
+    this.router.post(
+      '/upload',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      upload.single('file'),
+      this.uploadFile.bind(this)
+    );
+
+    // Multi-file upload endpoint (up to 5 files)
+    this.router.post(
+      '/upload-multiple',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      uploadMultiple,
+      this.uploadMultipleFiles.bind(this)
+    );
+
+    // Gemini-powered educational content endpoints
+    this.router.post(
+      '/lesson-summary',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.generateLessonSummary.bind(this)
+    );
+
+    this.router.post(
+      '/mini-quiz',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.generateMiniQuiz.bind(this)
+    );
+
+    this.router.post(
+      '/video-timestamps',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.generateVideoTimestamps.bind(this)
+    );
+
+    // ============================================================================
+    // AV CONTENT GENERATION ENDPOINTS
+    // ============================================================================
+
+    // Generate video lecture
+    this.router.post(
+      '/av/generate-lecture',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.generateAVLecture.bind(this)
+    );
+
+    // Generate audio summary (AV with slides - legacy)
+    this.router.post(
+      '/av/generate-summary',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.generateAVSummary.bind(this)
+    );
+
+    // Generate audio-only summary (simple audio for chat)
+    this.router.post(
+      '/audio-summary',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.generateAudioSummary.bind(this)
+    );
+
+    // Get specific AV content with slides
+    this.router.get(
+      '/av/content/:id',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.getAVContent.bind(this)
+    );
+
+    // List user's AV content
+    this.router.get(
+      '/av/content',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.listAVContent.bind(this)
+    );
+
+    // Submit feedback for AV content
+    this.router.post(
+      '/av/content/:id/feedback',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.submitAVFeedback.bind(this)
+    );
+
+    // Delete AV content
+    this.router.delete(
+      '/av/content/:id',
+      authMiddleware(['student', 'supervisor', 'admin']),
+      this.deleteAVContent.bind(this)
+    );
+  }
+
+  // ============================================================================
+  // PROFILE ENDPOINTS
+  // ============================================================================
+
+  private async getProfile(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const profile = await this.aiTeacherService.getOrCreateProfile(traineeId);
+      res.status(200).json(profile);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  private async updateProfile(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const updates = req.body;
+
+      // Validate allowed updates
+      const allowedFields = [
+        'personalityTraits',
+        'preferredLearningStyle',
+        'communicationPreference',
+        'language',
+        'likes',
+        'dislikes',
+      ];
+
+      const filteredUpdates: Record<string, any> = {};
+      for (const field of allowedFields) {
+        if (updates[field] !== undefined) {
+          filteredUpdates[field] = updates[field];
+        }
+      }
+
+      const profile = await this.aiTeacherService.updateProfile(traineeId, filteredUpdates);
+      res.status(200).json(profile);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  private async syncProfile(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const profile = await this.aiTeacherService.syncProfileWithPerformance(traineeId);
+      res.status(200).json(profile);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  // ============================================================================
+  // CHAT ENDPOINTS
+  // ============================================================================
+
+  private async getWelcome(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const teacherName = req.query.teacherName as string | undefined;
+
+      // Accept any teacherName - custom teachers supported via database
+      const welcome = await this.aiTeacherService.generateWelcome(traineeId, teacherName);
+      res.status(200).json(welcome);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  private async sendMessage(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const { message, attachments, lessonContext, teacherName } = req.body;
+
+      if (!message || typeof message !== 'string') {
+        res.status(400).json({ error: 'Message is required' });
+        return;
+      }
+
+      // Accept any teacherName - custom teachers supported via database
+      const response = await this.aiTeacherService.sendMessage(traineeId, message, attachments, lessonContext, teacherName);
+      res.status(200).json(response);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Stream chat responses using Server-Sent Events (SSE)
+   * Delivers AI responses chunk by chunk for real-time UI updates
+   */
+  private async sendMessageStream(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const { message, attachments, lessonContext, teacherName } = req.body;
+
+      if (!message || typeof message !== 'string') {
+        res.status(400).json({ error: 'Message is required' });
+        return;
+      }
+
+      // Accept any teacherName - custom teachers supported via database
+
+      // Set up SSE headers
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+      res.flushHeaders();
+
+      // Stream the response
+      for await (const chunk of this.aiTeacherService.sendMessageStream(
+        traineeId,
+        message,
+        attachments,
+        lessonContext,
+        teacherName
+      )) {
+        // Send as SSE event
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+
+        // Flush immediately for real-time delivery
+        if (typeof (res as any).flush === 'function') {
+          (res as any).flush();
+        }
+
+        // Break if done or error
+        if (chunk.type === 'done' || chunk.type === 'error') {
+          break;
+        }
+      }
+
+      // End the stream
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } catch (error) {
+      console.error('[AITeacherController] Streaming error:', error);
+      // If headers already sent, end the stream
+      if (res.headersSent) {
+        res.write(`data: ${JSON.stringify({ type: 'error', error: 'Stream error occurred' })}\n\n`);
+        res.end();
+      } else {
+        next(error);
+      }
+    }
+  }
+
+  private async getHistory(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const limit = parseInt(req.query.limit as string) || 10;
+      const teacherName = req.query.teacherName as string | undefined;
+
+      // Accept any teacherName - custom teachers supported via database
+      const history = await this.aiTeacherService.getSessionHistory(traineeId, limit, teacherName);
+      res.status(200).json(history);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  private async getAssignedTeacher(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const result = await this.aiTeacherService.getAssignedTeacher(traineeId);
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Get teacher info by name (avatar, displayName, voiceId, etc)
+   * Used by frontend to display teacher info dynamically
+   * GET /api/ai-teacher/teacher-info/:name
+   */
+  private async getTeacherInfo(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { name } = req.params;
+      const organizationId = req.user?.organizationId ?? undefined;
+
+      if (!name || typeof name !== 'string') {
+        res.status(400).json({ error: 'Teacher name is required' });
+        return;
+      }
+
+      const teacherInfo = await this.aiTeacherService.getTeacherInfo(name, organizationId);
+
+      if (!teacherInfo) {
+        res.status(404).json({ error: 'Teacher not found' });
+        return;
+      }
+
+      res.status(200).json(teacherInfo);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  // ============================================================================
+  // VOICE ENDPOINTS
+  // ============================================================================
+
+  private async textToSpeech(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { text, language, teacherName, voiceId } = req.body;
+      const organizationId = req.user?.organizationId ?? undefined;
+
+      if (!text || typeof text !== 'string') {
+        res.status(400).json({ error: 'Text is required' });
+        return;
+      }
+
+      // Accept any teacherName - custom teachers will be looked up in database
+      // Only validate that it's a non-empty string if provided
+      if (teacherName && typeof teacherName !== 'string') {
+        res.status(400).json({ error: 'teacherName must be a string' });
+        return;
+      }
+
+      const lang = language === 'ar' ? 'ar' : 'en';
+      // If voiceId is provided directly (e.g., for preview), use it; otherwise use teacherName lookup
+      // Pass organizationId to get the correct teacher for this user's organization
+      const audioBase64 = await this.aiTeacherService.textToSpeech(text, lang, teacherName, voiceId, organizationId);
+
+      res.status(200).json({ audio: audioBase64 });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Get welcome audio for a teacher persona
+   * Uses pre-defined welcome messages for instant response
+   * GET /api/ai-teacher/tts/welcome?teacherName=ahmed&language=ar
+   */
+  private async getWelcomeAudio(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const teacherName = req.query.teacherName as string || 'ahmed';
+      const language = (req.query.language as string) === 'ar' ? 'ar' : 'en';
+      const organizationId = req.user?.organizationId ?? undefined;
+
+      // Accept any teacherName - custom teachers will be looked up in database
+      if (!teacherName || typeof teacherName !== 'string') {
+        res.status(400).json({ error: 'teacherName must be a non-empty string' });
+        return;
+      }
+
+      // Pass organizationId to get the correct teacher for this user's organization
+      const result = await this.aiTeacherService.generateWelcomeAudio(teacherName, language, organizationId);
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Pre-render TTS for first sentence during streaming
+   * Extracts and generates audio for the first complete sentence
+   */
+  private async preRenderTTS(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { text, language } = req.body;
+
+      if (!text || typeof text !== 'string') {
+        res.status(400).json({ error: 'Text is required' });
+        return;
+      }
+
+      // Extract first sentence (look for sentence-ending punctuation)
+      const sentenceEndMatch = text.match(/^(.*?[.!?؟\n])/);
+      const firstSentence = sentenceEndMatch ? sentenceEndMatch[1].trim() : text.slice(0, 150).trim();
+
+      if (firstSentence.length < 10) {
+        res.status(400).json({ error: 'Text too short for pre-rendering' });
+        return;
+      }
+
+      const lang = language === 'ar' ? 'ar' : 'en';
+      const audioBase64 = await this.aiTeacherService.textToSpeech(firstSentence, lang);
+
+      res.status(200).json({
+        audio: audioBase64,
+        text: firstSentence,
+        isPartial: sentenceEndMatch !== null,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  private async speechToText(req: MulterRequest, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.file) {
+        res.status(400).json({ error: 'No audio file uploaded' });
+        return;
+      }
+
+      const language = (req.body.language === 'ar' ? 'ar' : 'en') as 'ar' | 'en';
+
+      console.log('[AITeacherController] Received audio file:', {
+        size: req.file.size,
+        mimetype: req.file.mimetype,
+        language,
+      });
+
+      const text = await this.aiTeacherService.speechToText(req.file.buffer, language);
+
+      res.status(200).json({ text });
+    } catch (error) {
+      console.error('[AITeacherController] Speech-to-text error:', error);
+      next(error);
+    }
+  }
+
+  // ============================================================================
+  // FILE UPLOAD
+  // ============================================================================
+
+  private async uploadFile(req: MulterRequest, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.file) {
+        res.status(400).json({ error: 'No file uploaded' });
+        return;
+      }
+
+      const attachment = await this.aiTeacherService.processUploadedFile(
+        req.file.buffer,
+        req.file.originalname,
+        req.file.mimetype
+      );
+
+      res.status(200).json(attachment);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Handle multiple file uploads (up to 5 files)
+   * Supports images, PDFs, Word docs, PowerPoints
+   */
+  private async uploadMultipleFiles(req: MulterRequest, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const files = req.files as Express.Multer.File[];
+
+      if (!files || files.length === 0) {
+        res.status(400).json({ error: 'No files uploaded' });
+        return;
+      }
+
+      console.log(`[AITeacherController] Processing ${files.length} files`);
+
+      // Process all files in parallel
+      const attachments = await Promise.all(
+        files.map(async (file) => {
+          try {
+            return await this.aiTeacherService.processUploadedFile(
+              file.buffer,
+              file.originalname,
+              file.mimetype
+            );
+          } catch (error) {
+            console.error(`[AITeacherController] Error processing file ${file.originalname}:`, error);
+            // Return error object for failed files
+            return {
+              id: `error-${Date.now()}`,
+              filename: file.originalname,
+              mimeType: file.mimetype,
+              size: file.size,
+              error: error instanceof Error ? error.message : 'Failed to process file',
+            };
+          }
+        })
+      );
+
+      res.status(200).json({ attachments, count: attachments.length });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  // ============================================================================
+  // GEMINI-POWERED EDUCATIONAL CONTENT
+  // ============================================================================
+
+  private async generateLessonSummary(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { lessonContext, language } = req.body;
+
+      console.log('[AITeacherController] generateLessonSummary called with:', {
+        hasLessonContext: !!lessonContext,
+        lessonName: lessonContext?.lessonName,
+        lessonNameAr: lessonContext?.lessonNameAr,
+        language,
+      });
+
+      if (!lessonContext) {
+        res.status(400).json({ error: 'Lesson context is required' });
+        return;
+      }
+
+      const summary = await this.aiTeacherService.generateLessonSummary(
+        lessonContext,
+        language || 'en'
+      );
+
+      res.status(200).json(summary);
+    } catch (error) {
+      console.error('[AITeacherController] generateLessonSummary error:', error);
+      next(error);
+    }
+  }
+
+  private async generateMiniQuiz(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { lessonContext, language, numQuestions } = req.body;
+
+      console.log('[AITeacherController] generateMiniQuiz called with:', {
+        hasLessonContext: !!lessonContext,
+        lessonName: lessonContext?.lessonName,
+        lessonNameAr: lessonContext?.lessonNameAr,
+        language,
+        numQuestions,
+      });
+
+      if (!lessonContext) {
+        res.status(400).json({ error: 'Lesson context is required' });
+        return;
+      }
+
+      const quiz = await this.aiTeacherService.generateMiniQuiz(
+        lessonContext,
+        language || 'en',
+        numQuestions || 3
+      );
+
+      res.status(200).json(quiz);
+    } catch (error) {
+      console.error('[AITeacherController] generateMiniQuiz error:', error);
+      next(error);
+    }
+  }
+
+  private async generateVideoTimestamps(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { lessonContext, question, language } = req.body;
+
+      if (!lessonContext) {
+        res.status(400).json({ error: 'Lesson context is required' });
+        return;
+      }
+
+      const timestamps = await this.aiTeacherService.generateVideoTimestamps(
+        lessonContext,
+        question || '',
+        language || 'en'
+      );
+
+      res.status(200).json(timestamps);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  // ============================================================================
+  // AV CONTENT GENERATION ENDPOINTS
+  // ============================================================================
+
+  /**
+   * Generate a video lecture with slides and audio
+   * POST /api/ai-teacher/av/generate-lecture
+   */
+  private async generateAVLecture(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const { topic, lessonContext, courseId, duration, language } = req.body;
+
+      if (!topic || typeof topic !== 'string') {
+        res.status(400).json({ error: 'Topic is required' });
+        return;
+      }
+
+      console.log('[AITeacherController] Generating AV lecture:', {
+        traineeId,
+        topic,
+        duration,
+        language,
+      });
+
+      const content = await this.avContentService.generateLecture({
+        traineeId,
+        topic,
+        lessonContext,
+        courseId,
+        duration: duration || 10,
+        language: language || 'en',
+      });
+
+      res.status(200).json(content);
+    } catch (error) {
+      console.error('[AITeacherController] Generate lecture error:', error);
+      next(error);
+    }
+  }
+
+  /**
+   * Generate an audio summary focused on weak areas
+   * POST /api/ai-teacher/av/generate-summary
+   */
+  private async generateAVSummary(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const { topic, sourceText, focusAreas, language } = req.body;
+
+      if (!topic || typeof topic !== 'string') {
+        res.status(400).json({ error: 'Topic is required' });
+        return;
+      }
+
+      console.log('[AITeacherController] Generating AV summary:', {
+        traineeId,
+        topic,
+        hasFocusAreas: !!focusAreas,
+        language,
+      });
+
+      const content = await this.avContentService.generateSummary({
+        traineeId,
+        topic,
+        sourceText,
+        focusAreas,
+        language: language || 'en',
+      });
+
+      res.status(200).json(content);
+    } catch (error) {
+      console.error('[AITeacherController] Generate summary error:', error);
+      next(error);
+    }
+  }
+
+  /**
+   * Get specific AV content with all slides
+   * GET /api/ai-teacher/av/content/:id
+   */
+  private async getAVContent(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const contentId = req.params.id;
+
+      const content = await this.avContentService.getContent(contentId, traineeId);
+      res.status(200).json(content);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * List user's AV content with pagination
+   * GET /api/ai-teacher/av/content
+   */
+  private async listAVContent(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const page = parseInt(req.query.page as string) || 1;
+      const limit = parseInt(req.query.limit as string) || 10;
+      const type = req.query.type as 'lecture' | 'summary' | undefined;
+
+      const result = await this.avContentService.listContent(traineeId, {
+        page,
+        limit,
+        type,
+      });
+
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Submit feedback for AV content
+   * POST /api/ai-teacher/av/content/:id/feedback
+   */
+  private async submitAVFeedback(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const contentId = req.params.id;
+      const { rating, helpful, comment, watchDuration, completedSlides } = req.body;
+
+      await this.avContentService.submitFeedback({
+        contentId,
+        traineeId,
+        rating,
+        helpful,
+        comment,
+        watchDuration,
+        completedSlides,
+      });
+
+      res.status(200).json({ success: true });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Delete AV content
+   * DELETE /api/ai-teacher/av/content/:id
+   */
+  private async deleteAVContent(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const contentId = req.params.id;
+
+      await this.avContentService.deleteContent(contentId, traineeId);
+      res.status(200).json({ success: true });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Generate audio-only summary (simple TTS without slides)
+   * Returns audio base64 for direct playback in chat
+   * POST /api/ai-teacher/audio-summary
+   */
+  private async generateAudioSummary(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const traineeId = req.user!.userId;
+      const { topic, focusAreas, language } = req.body;
+      const organizationId = req.user?.organizationId ?? undefined;
+
+      if (!topic || typeof topic !== 'string') {
+        res.status(400).json({ error: 'Topic is required' });
+        return;
+      }
+
+      console.log('[AITeacherController] Generating audio summary:', {
+        traineeId,
+        topic,
+        language,
+      });
+
+      const result = await this.aiTeacherService.generateAudioSummary(
+        traineeId,
+        topic,
+        focusAreas || [],
+        language || 'en',
+        organizationId
+      );
+
+      res.status(200).json(result);
+    } catch (error) {
+      console.error('[AITeacherController] Generate audio summary error:', error);
+      next(error);
+    }
+  }
+}

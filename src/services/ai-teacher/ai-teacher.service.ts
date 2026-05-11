@@ -1,0 +1,2565 @@
+/**
+ * AI Teacher Service
+ *
+ * Provides a personalized AI mentor experience for trainees,
+ * leveraging their historical performance data and maintaining
+ * trainee profiles in markdown files.
+ */
+
+import { injectable, inject } from 'tsyringe';
+import { PrismaClient } from '@prisma/client';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { PDFParse } = require('pdf-parse');
+import {
+  IAITeacherService,
+  TraineeProfile,
+  ChatMessage,
+  ChatResponse,
+  WelcomeResponse,
+  TeacherSession,
+  FileAttachment,
+  LessonContext,
+  StreamingChatResponse,
+  SessionNote,
+} from '../interfaces/ai-teacher.interface';
+import { ILLMProvider } from '../../providers/llm/llm-provider.interface';
+import { FallbackLLMProvider } from '../../providers/llm/fallback.provider';
+import { BrainService } from '../brain/brain.service';
+import { TEACHER_PERSONAS, TeacherPersonaName, isValidTeacherName } from './teacher-personas.config';
+import { getTeacherVoiceId, getTeacherWelcome, isStaticTeacher } from '../../config/teacher-voices.config';
+
+// Constants
+const PROFILES_DIR = path.join(process.cwd(), 'data', 'trainee-profiles');
+const ELEVENLABS_API_BASE = 'https://api.elevenlabs.io/v1';
+
+// ElevenLabs voice IDs - Using high-quality multilingual voices
+const VOICE_IDS = {
+  ar: 'onwK4e9ZLuTAKqWW03F9', // Daniel - Professional multilingual voice (excellent Arabic)
+  en: 'EXAVITQu4vr4xnSDxMaL', // Bella - English female
+};
+
+@injectable()
+export class AITeacherService implements IAITeacherService {
+  private elevenLabsApiKey: string;
+  private sessionCache: Map<string, TeacherSession> = new Map();
+  private fallbackProvider: FallbackLLMProvider;
+
+  constructor(
+    @inject('PrismaClient') private prisma: PrismaClient,
+    @inject('LLMProvider') private llmProvider: ILLMProvider,
+    @inject(BrainService) private brainService: BrainService
+  ) {
+    this.elevenLabsApiKey = process.env.ELEVENLABS_API_KEY || '';
+    this.fallbackProvider = new FallbackLLMProvider();
+    this.ensureProfilesDir();
+  }
+
+  // ============================================================================
+  // PROFILE MANAGEMENT
+  // ============================================================================
+
+  private async ensureProfilesDir(): Promise<void> {
+    try {
+      await fs.mkdir(PROFILES_DIR, { recursive: true });
+    } catch {
+      // Silently ignore if directory already exists
+    }
+  }
+
+  private getProfilePath(traineeId: string): string {
+    return path.join(PROFILES_DIR, `${traineeId}_profile.md`);
+  }
+
+  async getOrCreateProfile(traineeId: string): Promise<TraineeProfile> {
+    const profilePath = this.getProfilePath(traineeId);
+
+    try {
+      // Try to read existing profile
+      const content = await fs.readFile(profilePath, 'utf-8');
+      return this.parseProfileMarkdown(content, traineeId);
+    } catch {
+      // Profile doesn't exist, create from database
+      return this.createProfileFromDatabase(traineeId);
+    }
+  }
+
+  async updateProfile(traineeId: string, updates: Partial<TraineeProfile>): Promise<TraineeProfile> {
+    const profile = await this.getOrCreateProfile(traineeId);
+    const updatedProfile = { ...profile, ...updates, updatedAt: new Date() };
+    await this.saveProfile(updatedProfile);
+    return updatedProfile;
+  }
+
+  async syncProfileWithPerformance(traineeId: string): Promise<TraineeProfile> {
+    const profile = await this.getOrCreateProfile(traineeId);
+    return this.syncProfileWithPerformanceInternal(profile);
+  }
+
+  private async createProfileFromDatabase(traineeId: string): Promise<TraineeProfile> {
+    const trainee = await this.prisma.trainee.findUnique({
+      where: { id: traineeId },
+    });
+
+    if (!trainee) {
+      throw new Error('Trainee not found');
+    }
+
+    const profile: TraineeProfile = {
+      traineeId,
+      firstName: trainee.firstName,
+      lastName: trainee.lastName,
+      email: trainee.email,
+      personalityTraits: [],
+      preferredLearningStyle: 'mixed',
+      communicationPreference: 'casual',
+      language: 'en',
+      strengths: [],
+      weaknesses: [],
+      knowledgeGaps: [],
+      likes: [],
+      dislikes: [],
+      totalSessions: 0,
+      averageScore: 0,
+      currentStreak: trainee.currentStreak,
+      lastActiveAt: trainee.lastActiveAt,
+      recentTopics: [],
+      improvementAreas: [],
+      sessionNotes: [], // AI Teacher session logs
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    // Save the initial profile first to avoid recursive calls
+    await this.saveProfile(profile);
+
+    // Now sync with performance data (this will read the saved profile)
+    return this.syncProfileWithPerformanceInternal(profile);
+  }
+
+  /**
+   * Internal sync method that takes an existing profile to avoid recursive calls
+   */
+  private async syncProfileWithPerformanceInternal(profile: TraineeProfile): Promise<TraineeProfile> {
+    const traineeId = profile.traineeId;
+
+    // Fetch recent performance data
+    const sessions = await this.prisma.simulationSession.findMany({
+      where: { traineeId, status: 'completed' },
+      orderBy: { completedAt: 'desc' },
+      take: 20,
+    });
+
+    const voiceSessions = await this.prisma.voiceSession.findMany({
+      where: { traineeId },
+      orderBy: { endTime: 'desc' },
+      take: 10,
+    });
+
+    // Fetch completed lectures for course progress tracking
+    const completedLectures = await this.prisma.lectureCompletion.findMany({
+      where: { traineeId },
+      include: { lecture: { include: { course: true } } },
+      orderBy: { completedAt: 'desc' },
+      take: 20,
+    });
+
+    // Fetch completed assessments
+    const completedAssessments = await this.prisma.assessmentCompletion.findMany({
+      where: { traineeId },
+      orderBy: { completedAt: 'desc' },
+      take: 10,
+    });
+
+    // Analyze performance
+    const allScores: number[] = [];
+    const strengths: Set<string> = new Set(profile.strengths);
+    const weaknesses: Set<string> = new Set(profile.weaknesses);
+    const recentTopics: Set<string> = new Set(profile.recentTopics);
+
+    // Track completed courses/lectures for context
+    const completedCourseNames: Set<string> = new Set();
+    const recentLessonTopics: Set<string> = new Set();
+
+    // Process completed lectures
+    for (const lc of completedLectures) {
+      if (lc.lecture?.course?.title) {
+        completedCourseNames.add(lc.lecture.course.title);
+      }
+      if (lc.lecture?.title) {
+        recentLessonTopics.add(lc.lecture.title);
+      }
+    }
+
+    // Add assessment scores
+    for (const assessment of completedAssessments) {
+      allScores.push(assessment.score);
+    }
+
+    // Process simulation sessions
+    for (const session of sessions) {
+      if (session.metrics) {
+        try {
+          const metrics = JSON.parse(session.metrics as string);
+          if (metrics.aiEvaluatedScore) {
+            allScores.push(metrics.aiEvaluatedScore);
+          }
+        } catch {}
+      }
+      if (session.scenarioType) {
+        recentTopics.add(session.scenarioType);
+      }
+    }
+
+    // Process voice sessions
+    for (const session of voiceSessions) {
+      if (session.overallScore) {
+        allScores.push(session.overallScore);
+      }
+      if (session.analysis) {
+        try {
+          const analysis = JSON.parse(session.analysis as string);
+          if (analysis.strengths) {
+            analysis.strengths.forEach((s: string) => strengths.add(s));
+          }
+          if (analysis.weaknesses) {
+            analysis.weaknesses.forEach((w: string) => weaknesses.add(w));
+          }
+        } catch {}
+      }
+    }
+
+    // Fetch interaction reports for more detailed analysis
+    const reports = await this.prisma.interactionReport.findMany({
+      where: { traineeId },
+      orderBy: { generatedAt: 'desc' },
+      take: 5,
+    });
+
+    for (const report of reports) {
+      if (report.summary) {
+        try {
+          const summary = JSON.parse(report.summary as string);
+          if (summary.skillScores) {
+            Object.entries(summary.skillScores).forEach(([skill, data]: [string, any]) => {
+              if (data.score >= 80) {
+                strengths.add(skill);
+              } else if (data.score < 60) {
+                weaknesses.add(skill);
+              }
+            });
+          }
+        } catch {}
+      }
+    }
+
+    // Update profile
+    const averageScore = allScores.length > 0
+      ? Math.round(allScores.reduce((a, b) => a + b, 0) / allScores.length)
+      : profile.averageScore;
+
+    // Merge recent topics from lessons and simulations
+    const allRecentTopics = new Set([
+      ...Array.from(recentLessonTopics),
+      ...Array.from(recentTopics),
+    ]);
+
+    const updatedProfile: TraineeProfile = {
+      ...profile,
+      totalSessions: sessions.length + voiceSessions.length,
+      averageScore,
+      strengths: Array.from(strengths).slice(0, 5),
+      weaknesses: Array.from(weaknesses).slice(0, 5),
+      recentTopics: Array.from(allRecentTopics).slice(0, 8), // Include more topics
+      improvementAreas: Array.from(weaknesses).slice(0, 3),
+      // Add new fields for course progress
+      completedCoursesCount: completedCourseNames.size,
+      completedLecturesCount: completedLectures.length,
+      completedAssessmentsCount: completedAssessments.length,
+      updatedAt: new Date(),
+    };
+
+    await this.saveProfile(updatedProfile);
+    return updatedProfile;
+  }
+
+  private async saveProfile(profile: TraineeProfile): Promise<void> {
+    const markdown = this.generateProfileMarkdown(profile);
+    const profilePath = this.getProfilePath(profile.traineeId);
+    await fs.writeFile(profilePath, markdown, 'utf-8');
+  }
+
+  private generateProfileMarkdown(profile: TraineeProfile): string {
+    // Generate session notes section (last 5 notes)
+    const sessionNotesSection = profile.sessionNotes && profile.sessionNotes.length > 0
+      ? profile.sessionNotes.slice(-5).map(note => `
+#### ${note.timestamp} - ${note.topic}
+${note.summary}
+${note.insightsGained.length > 0 ? `\n**Insights Gained:**\n${note.insightsGained.map(i => `- ${i}`).join('\n')}` : ''}
+${note.areasToReview.length > 0 ? `\n**Areas to Review:**\n${note.areasToReview.map(a => `- ${a}`).join('\n')}` : ''}
+`).join('\n')
+      : '- No session notes yet';
+
+    return `# Trainee Profile: ${profile.firstName} ${profile.lastName}
+
+## Basic Information
+- **ID**: ${profile.traineeId}
+- **Email**: ${profile.email}
+- **Created**: ${profile.createdAt.toISOString()}
+- **Last Updated**: ${profile.updatedAt.toISOString()}
+
+## Learning Profile
+- **Preferred Learning Style**: ${profile.preferredLearningStyle}
+- **Communication Preference**: ${profile.communicationPreference}
+- **Language**: ${profile.language}
+
+### Personality Traits
+${profile.personalityTraits.map(t => `- ${t}`).join('\n') || '- Not assessed yet'}
+
+## Performance Summary
+- **Total Sessions**: ${profile.totalSessions}
+- **Average Score**: ${profile.averageScore}%
+- **Current Streak**: ${profile.currentStreak} days
+- **Courses Completed**: ${profile.completedCoursesCount || 0}
+- **Lectures Completed**: ${profile.completedLecturesCount || 0}
+- **Assessments Completed**: ${profile.completedAssessmentsCount || 0}
+- **Last Active**: ${profile.lastActiveAt?.toISOString() || 'Never'}
+
+### Strengths
+${profile.strengths.map(s => `- ${s}`).join('\n') || '- Not identified yet'}
+
+### Weaknesses
+${profile.weaknesses.map(w => `- ${w}`).join('\n') || '- Not identified yet'}
+
+### Knowledge Gaps
+${profile.knowledgeGaps.map(g => `- ${g}`).join('\n') || '- Not identified yet'}
+
+### Recent Topics
+${profile.recentTopics.map(t => `- ${t}`).join('\n') || '- No recent activity'}
+
+### Areas for Improvement
+${profile.improvementAreas.map(a => `- ${a}`).join('\n') || '- Not identified yet'}
+
+## Preferences
+
+### Likes
+${profile.likes.map(l => `- ${l}`).join('\n') || '- Not specified'}
+
+### Dislikes
+${profile.dislikes.map(d => `- ${d}`).join('\n') || '- Not specified'}
+
+## AI Teacher Session Notes (Recent)
+${sessionNotesSection}
+
+---
+*This profile is automatically updated based on training performance and AI Teacher interactions.*
+`;
+  }
+
+  private parseProfileMarkdown(content: string, traineeId: string): TraineeProfile {
+    // Parse sections from markdown
+    const extractList = (section: string): string[] => {
+      const match = content.match(new RegExp(`### ${section}\\n([\\s\\S]*?)(?=\\n###|\\n##|\\n---|$)`));
+      if (!match) return [];
+      return match[1]
+        .split('\n')
+        .filter(line => line.startsWith('- ') && !line.includes('Not'))
+        .map(line => line.replace('- ', '').trim());
+    };
+
+    const extractValue = (pattern: string, defaultValue: string): string => {
+      const match = content.match(new RegExp(`\\*\\*${pattern}\\*\\*: (.+)`));
+      return match ? match[1].trim() : defaultValue;
+    };
+
+    // Extract basic info
+    const nameMatch = content.match(/# Trainee Profile: (.+) (.+)/);
+    const firstName = nameMatch?.[1] || '';
+    const lastName = nameMatch?.[2] || '';
+
+    // Parse session notes section
+    const sessionNotes: SessionNote[] = [];
+    const sessionNotesSection = content.match(/## AI Teacher Session Notes.*?\n([\s\S]*?)(?=\n---|\n##|$)/);
+    if (sessionNotesSection) {
+      const noteBlocks = sessionNotesSection[1].split(/\n####/).filter(b => b.trim() && !b.includes('No session notes'));
+      for (const block of noteBlocks) {
+        const headerMatch = block.match(/^\s*(.+?) - (.+?)\n/);
+        if (headerMatch) {
+          const insightsMatch = block.match(/\*\*Insights Gained:\*\*\n([\s\S]*?)(?=\*\*|$)/);
+          const areasMatch = block.match(/\*\*Areas to Review:\*\*\n([\s\S]*?)(?=\*\*|$)/);
+
+          sessionNotes.push({
+            timestamp: headerMatch[1].trim(),
+            topic: headerMatch[2].trim(),
+            summary: block.replace(headerMatch[0], '').split('\n**')[0].trim(),
+            insightsGained: insightsMatch
+              ? insightsMatch[1].split('\n').filter(l => l.startsWith('- ')).map(l => l.slice(2).trim())
+              : [],
+            areasToReview: areasMatch
+              ? areasMatch[1].split('\n').filter(l => l.startsWith('- ')).map(l => l.slice(2).trim())
+              : [],
+          });
+        }
+      }
+    }
+
+    return {
+      traineeId,
+      firstName,
+      lastName,
+      email: extractValue('Email', ''),
+      personalityTraits: extractList('Personality Traits'),
+      preferredLearningStyle: extractValue('Preferred Learning Style', 'mixed') as any,
+      communicationPreference: extractValue('Communication Preference', 'casual') as any,
+      language: 'en' as 'ar' | 'en', // Force English - platform is English only
+      strengths: extractList('Strengths'),
+      weaknesses: extractList('Weaknesses'),
+      knowledgeGaps: extractList('Knowledge Gaps'),
+      likes: extractList('Likes'),
+      dislikes: extractList('Dislikes'),
+      totalSessions: parseInt(extractValue('Total Sessions', '0')) || 0,
+      averageScore: parseInt(extractValue('Average Score', '0')) || 0,
+      currentStreak: parseInt(extractValue('Current Streak', '0')) || 0,
+      lastActiveAt: null,
+      recentTopics: extractList('Recent Topics'),
+      improvementAreas: extractList('Areas for Improvement'),
+      sessionNotes,
+      createdAt: new Date(extractValue('Created', new Date().toISOString())),
+      updatedAt: new Date(extractValue('Last Updated', new Date().toISOString())),
+    };
+  }
+
+  /**
+   * Add a session note to the trainee's profile after a meaningful AI Teacher interaction
+   */
+  async addSessionNote(traineeId: string, note: SessionNote): Promise<void> {
+    const profile = await this.getOrCreateProfile(traineeId);
+
+    // Keep only the last 10 session notes to prevent file bloat
+    const updatedNotes = [...(profile.sessionNotes || []), note].slice(-10);
+
+    await this.updateProfile(traineeId, {
+      sessionNotes: updatedNotes,
+      updatedAt: new Date(),
+    });
+  }
+
+  // ============================================================================
+  // TEACHER PERSONA HELPERS
+  // ============================================================================
+
+  private getSessionKey(traineeId: string, teacherName?: string): string {
+    return teacherName ? `${traineeId}:${teacherName}` : traineeId;
+  }
+
+  /**
+   * Get Brain/RAG context for Ahmed, Noura, Anas
+   */
+  private async getBrainContext(traineeId: string, teacherName: TeacherPersonaName, userMessage: string): Promise<string> {
+    const persona = TEACHER_PERSONAS[teacherName];
+    if (persona.contextSource !== 'brain') return '';
+
+    try {
+      // Get trainee's organizationId
+      const trainee = await this.prisma.trainee.findUnique({
+        where: { id: traineeId },
+        select: { organizationId: true },
+      });
+
+      if (!trainee?.organizationId) return '';
+
+      const query = `${persona.brainQueryPrefix || ''} ${userMessage}`.trim().slice(0, 200);
+      const result = await this.brainService.queryBrain({
+        query,
+        organizationId: trainee.organizationId,
+        topK: 3,
+        scoreThreshold: 0.3,
+      });
+
+      if (!result.results || result.results.length === 0) return 'No relevant documents found.';
+
+      return result.results
+        .map((r) => `[${r.documentTitle}]: ${r.content}`)
+        .join('\n\n');
+    } catch (error) {
+      console.error('[AITeacherService] getBrainContext error:', error);
+      return 'Knowledge base temporarily unavailable.';
+    }
+  }
+
+  /**
+   * Extract text content from a course attachment's base64 data URL.
+   * Uses document-parser for PDF/DOCX/TXT files. Returns truncated text.
+   */
+  private async extractAttachmentContent(fileUrl: string, fileType: string, fileName: string): Promise<string> {
+    try {
+      // Only process text-extractable files (pdf, document/docx, txt)
+      if (fileType === 'image') return '';
+
+      // Extract MIME type and base64 data from data URL: data:{mime};base64,{data}
+      const match = fileUrl.match(/^data:([^;]+);base64,(.+)$/);
+      if (!match) return '';
+
+      const mimeType = match[1];
+      const base64Data = match[2];
+      const buffer = Buffer.from(base64Data, 'base64');
+
+      // Import document parser
+      const { parseDocument, isSupportedFileType } = await import('../../utils/document-parser');
+
+      if (!isSupportedFileType(mimeType)) return '';
+
+      const parsed = await parseDocument(buffer, mimeType);
+      // Truncate to ~2000 chars to stay within token limits
+      const text = parsed.text.length > 2000
+        ? parsed.text.substring(0, 2000) + '... [content truncated]'
+        : parsed.text;
+
+      return text;
+    } catch (error) {
+      console.error(`[AITeacherService] Failed to extract content from ${fileName}:`, error);
+      return '';
+    }
+  }
+
+  /**
+   * Get available courses context for AI Teacher recommendations
+   * Returns a formatted string with courses the AI can recommend to the trainee
+   * Prioritizes the student's group courses with full file content access
+   */
+  private async getCoursesContext(traineeId: string, isArabic: boolean): Promise<string> {
+    try {
+      // Get trainee's organizationId
+      const trainee = await this.prisma.trainee.findUnique({
+        where: { id: traineeId },
+        select: { organizationId: true },
+      });
+
+      if (!trainee?.organizationId) return '';
+
+      // Get completed lectures separately
+      const lectureCompletions = await this.prisma.lectureCompletion.findMany({
+        where: { traineeId },
+        select: { lectureId: true },
+      });
+      const completedLectureIds = new Set(lectureCompletions.map(lc => lc.lectureId));
+
+      // Get student's group memberships to find group-specific courses
+      const groupMemberships = await this.prisma.groupMember.findMany({
+        where: { traineeId, isActive: true },
+        include: {
+          group: {
+            include: {
+              courses: { include: { course: { select: { id: true } } } },
+            },
+          },
+        },
+      });
+
+      const groupCourseIds = new Set(
+        groupMemberships.flatMap(m => m.group.courses.map(gc => gc.course.id))
+      );
+      const groupNames = groupMemberships.map(m => m.group.name);
+
+      // Course select fields (shared between both queries)
+      const courseSelect = {
+        id: true,
+        titleAr: true,
+        titleEn: true,
+        descriptionAr: true,
+        descriptionEn: true,
+        category: true,
+        difficulty: true,
+        estimatedDurationMinutes: true,
+        objectivesAr: true,
+        objectivesEn: true,
+        notesAr: true,
+        notesEn: true,
+        lectures: {
+          orderBy: { orderInCourse: 'asc' as const },
+          select: {
+            id: true,
+            titleAr: true,
+            titleEn: true,
+            descriptionAr: true,
+            descriptionEn: true,
+            durationMinutes: true,
+            orderInCourse: true,
+          },
+        },
+        attachments: {
+          select: {
+            id: true,
+            titleAr: true,
+            titleEn: true,
+            fileName: true,
+            fileType: true,
+            fileUrl: true,
+          },
+          orderBy: { displayOrder: 'asc' as const },
+        },
+      };
+
+      // Get ALL published courses for this organization
+      const allCourses = await this.prisma.course.findMany({
+        where: {
+          organizationId: trainee.organizationId,
+          isPublished: true,
+        },
+        select: courseSelect,
+        orderBy: [
+          { difficulty: 'asc' },
+          { createdAt: 'desc' },
+        ],
+      });
+
+      if (allCourses.length === 0) return '';
+
+      // Split into group courses and other courses
+      const groupCourses = allCourses.filter(c => groupCourseIds.has(c.id));
+      const otherCourses = allCourses.filter(c => !groupCourseIds.has(c.id));
+
+      // Base URL for course links
+      const baseUrl = process.env.FRONTEND_URL || 'https://2ystudy.macsoft.ai';
+
+      // Format a course with full details (used for group courses)
+      const formatCourseDetailed = async (course: typeof allCourses[0], includeFileContent: boolean) => {
+        const title = course.titleEn || course.titleAr;
+        const description = course.descriptionEn || course.descriptionAr;
+        const objectives = this.safeJsonParse(course.objectivesEn || course.objectivesAr, []);
+        const difficultyLabel = this.getDifficultyLabel(course.difficulty, false);
+        const courseUrl = `${baseUrl}/courses/${course.id}`;
+        const notes = course.notesEn || course.notesAr;
+
+        // Format lessons with full details and completion status
+        const lectures = course.lectures.map((l, idx) => {
+          const lectureTitle = l.titleEn || l.titleAr;
+          const lectureDesc = l.descriptionEn || l.descriptionAr;
+          const isCompleted = completedLectureIds.has(l.id);
+          const status = isCompleted ? '✅ Completed' : '⏳ Not completed';
+          const lectureUrl = `${baseUrl}/courses/${course.id}?lesson=${l.id}`;
+
+          return `  ${idx + 1}. ${lectureTitle} (${l.durationMinutes} min) - ${status}
+     Description: ${lectureDesc || 'Not available'}
+     Link: ${lectureUrl}`;
+        }).join('\n');
+
+        // Format attachments with file content for group courses
+        let attachmentsSection = '';
+        if (course.attachments && course.attachments.length > 0) {
+          const attachmentParts: string[] = [];
+          let fileCount = 0;
+          for (const a of course.attachments) {
+            const attachTitle = a.titleEn || a.titleAr || a.fileName;
+
+            if (includeFileContent && a.fileType !== 'image' && fileCount < 3) {
+              // Extract actual file content for group courses
+              const content = await this.extractAttachmentContent(a.fileUrl, a.fileType, a.fileName);
+              if (content) {
+                attachmentParts.push(`  ### File: ${attachTitle} (${a.fileType})\n${content}`);
+                fileCount++;
+              } else {
+                attachmentParts.push(`  - ${attachTitle} (${a.fileType})`);
+              }
+            } else {
+              attachmentParts.push(`  - ${attachTitle} (${a.fileType})`);
+            }
+          }
+          attachmentsSection = `\n- Attachments:\n${attachmentParts.join('\n')}`;
+        }
+
+        // Calculate completion progress
+        const completedCount = course.lectures.filter(l => completedLectureIds.has(l.id)).length;
+        const totalCount = course.lectures.length;
+        const progressPercent = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 0;
+        const progressText = `${completedCount}/${totalCount} lessons completed (${progressPercent}%)`;
+
+        return `### ${title}
+- Course ID: ${course.id}
+- Full Link: ${courseUrl}
+- Level: ${difficultyLabel}
+- Total Duration: ${course.estimatedDurationMinutes} minutes
+- Trainee Progress: ${progressText}
+- Description: ${description}
+- Objectives: ${objectives.join(', ')}${notes ? `\n- Trainer Notes: ${notes}` : ''}${attachmentsSection}
+- Detailed Lessons:
+${lectures}`;
+      };
+
+      // Format a course with brief info (used for other courses)
+      const formatCourseBrief = (course: typeof allCourses[0]) => {
+        const title = course.titleEn || course.titleAr;
+        const description = course.descriptionEn || course.descriptionAr;
+        const objectives = this.safeJsonParse(course.objectivesEn || course.objectivesAr, []);
+        const difficultyLabel = this.getDifficultyLabel(course.difficulty, false);
+        const courseUrl = `${baseUrl}/courses/${course.id}`;
+        const completedCount = course.lectures.filter(l => completedLectureIds.has(l.id)).length;
+        const totalCount = course.lectures.length;
+        const progressPercent = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 0;
+
+        return `### ${title}
+- Link: ${courseUrl}
+- Level: ${difficultyLabel} | Duration: ${course.estimatedDurationMinutes} min | Progress: ${completedCount}/${totalCount} (${progressPercent}%)
+- Description: ${description}
+- Objectives: ${objectives.join(', ')}`;
+      };
+
+      // Build the context
+      let context = '';
+
+      // Group courses section (detailed, with file content)
+      if (groupCourses.length > 0) {
+        const groupCoursesFormatted = await Promise.all(
+          groupCourses.map(c => formatCourseDetailed(c, true))
+        );
+        context += `## Your Assigned Courses (Group: ${groupNames.join(', ')})
+
+These are the courses specifically assigned to this student's group. Prioritize recommending from these courses based on the student's progress and level.
+
+${groupCoursesFormatted.join('\n\n')}`;
+      }
+
+      // Other courses section (brief)
+      if (otherCourses.length > 0) {
+        const otherCoursesFormatted = otherCourses.map(formatCourseBrief).join('\n\n');
+        context += `${groupCourses.length > 0 ? '\n\n' : ''}## Other Available Courses
+
+${otherCoursesFormatted}`;
+      }
+
+      return `${context}
+
+---
+Instructions for course recommendations:
+- When recommending courses, prioritize the student's assigned group courses first
+- Recommend courses based on the student's current progress and difficulty level
+- If the student asks about file/document content, use the extracted text above to answer
+- About a specific lesson: mention its name, description, and direct link
+- Write the full link on a separate line, do not truncate
+- Use the direct lesson link if asked about a specific lesson`;
+    } catch (error) {
+      console.error('[AITeacherService] getCoursesContext error:', error);
+      return '';
+    }
+  }
+
+  private safeJsonParse(json: string | null, defaultValue: any): any {
+    if (!json) return defaultValue;
+    try {
+      return JSON.parse(json);
+    } catch {
+      return defaultValue;
+    }
+  }
+
+  private getDifficultyLabel(difficulty: string, isArabic: boolean): string {
+    const labels: Record<string, { ar: string; en: string }> = {
+      beginner: { ar: 'مبتدئ', en: 'Beginner' },
+      intermediate: { ar: 'متوسط', en: 'Intermediate' },
+      advanced: { ar: 'متقدم', en: 'Advanced' },
+    };
+    return isArabic ? labels[difficulty]?.ar || difficulty : labels[difficulty]?.en || difficulty;
+  }
+
+  /**
+   * Get comprehensive user performance history context
+   * Includes course progress, simulations, voice sessions, quizzes, and diagnostics
+   */
+  private async getUserHistoryContext(traineeId: string): Promise<string> {
+    try {
+      const sections: string[] = [];
+
+      // Get trainee with organization
+      const trainee = await this.prisma.trainee.findUnique({
+        where: { id: traineeId },
+        select: {
+          firstName: true,
+          lastName: true,
+          currentStreak: true,
+          lastActiveAt: true,
+          organizationId: true,
+        },
+      });
+
+      // Course Progress - Most important for learning
+      const lectureCompletions = await this.prisma.lectureCompletion.findMany({
+        where: { traineeId },
+        include: {
+          lecture: {
+            include: {
+              course: {
+                select: { id: true, titleAr: true, titleEn: true, difficulty: true }
+              }
+            }
+          }
+        },
+        orderBy: { completedAt: 'desc' },
+        take: 20,
+      });
+
+      if (lectureCompletions.length > 0) {
+        // Group by course
+        const courseProgress: Record<string, { title: string; completed: string[]; lastDate: Date }> = {};
+        for (const lc of lectureCompletions) {
+          const courseId = lc.lecture.courseId;
+          const courseTitle = lc.lecture.course?.titleEn || lc.lecture.course?.titleAr || 'Unknown';
+          if (!courseProgress[courseId]) {
+            courseProgress[courseId] = { title: courseTitle, completed: [], lastDate: lc.completedAt };
+          }
+          courseProgress[courseId].completed.push(lc.lecture.titleEn || lc.lecture.titleAr || lc.lecture.title);
+          if (lc.completedAt > courseProgress[courseId].lastDate) {
+            courseProgress[courseId].lastDate = lc.completedAt;
+          }
+        }
+
+        const courseProgressText = Object.entries(courseProgress).map(([_, data]) => {
+          return `- ${data.title}: Completed ${data.completed.length} lessons (Last activity: ${data.lastDate.toLocaleDateString('en-US')})
+  Completed lessons: ${data.completed.slice(0, 5).join(', ')}${data.completed.length > 5 ? '...' : ''}`;
+        }).join('\n');
+
+        sections.push(`## Trainee Course Progress:\n${courseProgressText}`);
+      }
+
+      // Last 10 simulation sessions with more details
+      const simSessions = await this.prisma.simulationSession.findMany({
+        where: { traineeId },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+        select: {
+          scenarioType: true,
+          difficultyLevel: true,
+          status: true,
+          outcome: true,
+          metrics: true,
+          createdAt: true,
+        },
+      });
+      if (simSessions.length > 0) {
+        const simText = simSessions.map(s => {
+          // Parse metrics if available to get scores
+          const metrics = this.safeJsonParse(s.metrics, null);
+          const avgScore = metrics?.overallScore ?? null;
+          return `- ${s.scenarioType} (${s.difficultyLevel}) | Result: ${s.outcome ?? 'Incomplete'} | Average: ${avgScore ?? 'N/A'}% | ${s.createdAt.toLocaleDateString('en-US')}`;
+        }).join('\n');
+        sections.push(`## Text Simulation Sessions:\n${simText}`);
+      }
+
+      // Last 5 voice sessions
+      const voiceSessions = await this.prisma.voiceSession.findMany({
+        where: { traineeId },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+        select: { overallScore: true, durationSeconds: true, createdAt: true },
+      });
+      if (voiceSessions.length > 0) {
+        const voiceText = voiceSessions.map(v =>
+          `- Score: ${v.overallScore ?? 'N/A'}% | Duration: ${Math.round(v.durationSeconds / 60)} min | ${v.createdAt.toLocaleDateString('en-US')}`
+        ).join('\n');
+        sections.push(`## Voice Training Sessions:\n${voiceText}`);
+      }
+
+      // Latest diagnostic report with skill breakdown
+      const latestDiagnostic = await this.prisma.dailySkillReport.findFirst({
+        where: { traineeId },
+        orderBy: { date: 'desc' },
+        select: { date: true, overallScore: true, level: true, skillScores: true, strengths: true, weaknesses: true },
+      });
+      if (latestDiagnostic) {
+        const skills = this.safeJsonParse(latestDiagnostic.skillScores, {});
+        // strengths and weaknesses are already string arrays
+        const strengths = latestDiagnostic.strengths || [];
+        const weaknesses = latestDiagnostic.weaknesses || [];
+
+        let diagText = `- Date: ${latestDiagnostic.date.toLocaleDateString('en-US')}
+- Overall Level: ${latestDiagnostic.level} (${latestDiagnostic.overallScore}%)`;
+
+        if (Object.keys(skills).length > 0) {
+          diagText += '\n- Skill Details:';
+          for (const [skill, score] of Object.entries(skills)) {
+            diagText += `\n  • ${skill}: ${score}%`;
+          }
+        }
+        if (strengths.length > 0) {
+          diagText += `\n- Strengths: ${strengths.join(', ')}`;
+        }
+        if (weaknesses.length > 0) {
+          diagText += `\n- Weaknesses: ${weaknesses.join(', ')}`;
+        }
+
+        sections.push(`## Latest Diagnostic Report:\n${diagText}`);
+      }
+
+      // Quiz attempts
+      const quizAttempts = await this.prisma.quizAttempt.findMany({
+        where: { traineeId },
+        orderBy: { startedAt: 'desc' },
+        take: 5,
+        select: { score: true, totalPoints: true, earnedPoints: true, passed: true, startedAt: true },
+      });
+      if (quizAttempts.length > 0) {
+        const quizText = quizAttempts.map(q =>
+          `- Score: ${q.score ?? 'N/A'}% | Points: ${q.earnedPoints ?? 0}/${q.totalPoints ?? 0} | ${q.passed ? 'Passed ✅' : 'Failed ❌'} | ${q.startedAt.toLocaleDateString('en-US')}`
+        ).join('\n');
+        sections.push(`## Quiz Attempts:\n${quizText}`);
+      }
+
+      // Summary stats
+      if (trainee) {
+        sections.unshift(`## Trainee Summary:
+- Name: ${trainee.firstName} ${trainee.lastName}
+- Current Streak: ${trainee.currentStreak || 0} days
+- Last Active: ${trainee.lastActiveAt?.toLocaleDateString('en-US') || 'Unknown'}`);
+      }
+
+      return sections.length > 0 ? sections.join('\n\n') : 'No training history yet. This is a new trainee.';
+    } catch (error) {
+      console.error('[AITeacherService] getUserHistoryContext error:', error);
+      return 'Performance history is temporarily unavailable.';
+    }
+  }
+
+  /**
+   * Build system prompt for a specific teacher persona
+   */
+  private async buildPersonaSystemPrompt(
+    traineeId: string,
+    teacherName: TeacherPersonaName,
+    profileMarkdown: string,
+    lessonContextSection: string,
+    attachmentContext: string,
+    isArabic: boolean,
+    userMessage?: string
+  ): Promise<string> {
+    const persona = TEACHER_PERSONAS[teacherName];
+
+    // Get context based on persona type
+    let context: string;
+    if (persona.contextSource === 'brain') {
+      context = await this.getBrainContext(traineeId, teacherName, userMessage || '');
+    } else {
+      context = await this.getUserHistoryContext(traineeId);
+    }
+
+    // Select the right system prompt template
+    const template = isArabic ? persona.systemPromptAr : persona.systemPromptEn;
+
+    // Replace placeholders
+    let prompt = template
+      .replace('{{PROFILE}}', profileMarkdown)
+      .replace('{{CONTEXT}}', context);
+
+    // Append lesson context and attachments if present
+    if (lessonContextSection) {
+      prompt += '\n' + lessonContextSection;
+    }
+    if (attachmentContext) {
+      prompt += '\n' + attachmentContext;
+    }
+
+    return prompt;
+  }
+
+  // ============================================================================
+  // CHAT & WELCOME
+  // ============================================================================
+
+  // Cache for welcome messages to avoid repeated LLM calls
+  private welcomeCache: Map<string, { welcome: WelcomeResponse; timestamp: number }> = new Map();
+  private readonly WELCOME_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+  async generateWelcome(traineeId: string, teacherName?: string): Promise<WelcomeResponse> {
+    const cacheKey = this.getSessionKey(traineeId, teacherName);
+
+    // Check cache first
+    const cached = this.welcomeCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < this.WELCOME_CACHE_TTL) {
+      return cached.welcome;
+    }
+
+    // Get profile (create if needed, but don't wait for full sync)
+    const profile = await this.getOrCreateProfile(traineeId);
+
+    // Generate a quick template-based greeting first (instant response)
+    const isArabic = profile.language === 'ar';
+
+    // Quick template greeting while AI generates a better one
+    let greeting = this.generateTemplateGreeting(profile, isArabic);
+
+    // Try to get AI-generated greeting with a short timeout
+    try {
+      // Support both static teachers and custom teachers from database
+      const greetingGenerator = teacherName
+        ? (isValidTeacherName(teacherName)
+            ? this.generatePersonaGreeting(profile, isArabic, teacherName as TeacherPersonaName)
+            : this.generateCustomTeacherGreeting(profile, isArabic, teacherName))
+        : this.generateAIGreeting(profile, isArabic);
+
+      const aiGreeting = await Promise.race([
+        greetingGenerator,
+        new Promise<string>((_, reject) =>
+          setTimeout(() => reject(new Error('timeout')), 8000) // 8 second timeout
+        ),
+      ]) as string;
+
+      if (aiGreeting) {
+        greeting = aiGreeting;
+      }
+    } catch {
+      // Using template greeting - AI timed out or failed
+    }
+
+    // Generate suggested topics based on weaknesses
+    const suggestedTopics = profile.weaknesses.length > 0
+      ? profile.weaknesses.slice(0, 3)
+      : ['HVAC Systems Basics', 'Electrical Power Systems', 'PLC & Automation'];
+
+    // Generate audio if ElevenLabs key is available (do this in background)
+    let greetingAudio: string | undefined;
+    if (this.elevenLabsApiKey) {
+      try {
+        greetingAudio = await this.textToSpeech(greeting, profile.language);
+      } catch {
+        // Audio generation failed - continue without audio
+      }
+    }
+
+    const welcome: WelcomeResponse = {
+      greeting,
+      greetingAudio,
+      recentProgress: {
+        sessionsCompleted: profile.totalSessions,
+        averageScore: profile.averageScore,
+        improvement: profile.averageScore > 70 ? 'excellent' : profile.averageScore > 50 ? 'good' : 'needs_work',
+      },
+      suggestedTopics,
+    };
+
+    // Cache the result
+    this.welcomeCache.set(cacheKey, { welcome, timestamp: Date.now() });
+
+    // Sync profile in background (don't wait)
+    this.syncProfileWithPerformance(traineeId).catch(() => {
+      // Background sync failed - non-critical
+    });
+
+    return welcome;
+  }
+
+  /**
+   * Generate a quick template-based greeting (no AI call)
+   */
+  private generateTemplateGreeting(profile: TraineeProfile, isArabic: boolean): string {
+    const name = profile.firstName;
+    const sessions = profile.totalSessions;
+    const score = profile.averageScore;
+
+    if (isArabic) {
+      // Always respond in English regardless of language setting
+      if (sessions === 0) {
+        return `Welcome ${name}! 🔧\n\nI'm glad to be your teacher today. I'm here to help you on your electromechanical engineering learning journey.\n\nWhat would you like to start with today?`;
+      } else if (score >= 70) {
+        return `Hello ${name}! 🌟\n\nGreat job! Your performance is excellent with ${sessions} sessions and an average of ${score}%.\n\nWhat would you like to focus on today?`;
+      } else {
+        return `Hello ${name}! 👋\n\nWelcome back! You have ${sessions} completed sessions. Keep training and you'll keep improving.\n\nWhat would you like to learn today?`;
+      }
+    } else {
+      if (sessions === 0) {
+        return `Welcome ${name}! 🔧\n\nI'm excited to be your teacher today. I'm here to help you on your electromechanical engineering learning journey.\n\nWhat would you like to start with today?`;
+      } else if (score >= 70) {
+        return `Hello ${name}! 🌟\n\nGreat work! Your performance is excellent with ${sessions} sessions and ${score}% average.\n\nWhat would you like to focus on today?`;
+      } else {
+        return `Hi ${name}! 👋\n\nGood to see you! You have ${sessions} completed sessions. Keep practicing and you'll improve.\n\nWhat would you like to learn today?`;
+      }
+    }
+  }
+
+  /**
+   * Generate AI-powered personalized greeting
+   */
+  private async generateAIGreeting(profile: TraineeProfile, isArabic: boolean): Promise<string> {
+    const greetingPrompt = isArabic
+      ? `You are a friendly, professional AI teacher for electromechanical engineering training.
+
+Trainee name: ${profile.firstName} ${profile.lastName}
+Sessions completed: ${profile.totalSessions}
+Average score: ${profile.averageScore}%
+Strengths: ${profile.strengths.join(', ') || 'Not identified yet'}
+Weaknesses: ${profile.weaknesses.join(', ') || 'Not identified yet'}
+Recent topics: ${profile.recentTopics.join(', ') || 'None'}
+
+Write a short, personalized welcome greeting (2-3 sentences only) that:
+1. Addresses the trainee by name
+2. Makes a positive note about their progress or encourages them to start
+3. Asks an open question about what they want to learn today
+
+IMPORTANT: Always respond in English only. Be warm and professional.`
+      : `You are a friendly, professional AI teacher for electromechanical engineering training.
+
+Trainee name: ${profile.firstName} ${profile.lastName}
+Sessions completed: ${profile.totalSessions}
+Average score: ${profile.averageScore}%
+Strengths: ${profile.strengths.join(', ') || 'Not identified yet'}
+Weaknesses: ${profile.weaknesses.join(', ') || 'Not identified yet'}
+Recent topics: ${profile.recentTopics.join(', ') || 'None'}
+
+Write a short, personalized welcome greeting (2-3 sentences only) that:
+1. Addresses the trainee by name
+2. Makes a positive note about their progress or encourages them to start
+3. Asks an open question about what they want to learn today
+
+Be warm and professional.`;
+
+    return this.fallbackProvider.complete({
+      prompt: greetingPrompt,
+      maxTokens: 300,
+      temperature: 0.7,
+    });
+  }
+
+  /**
+   * Generate persona-specific greeting
+   */
+  private async generatePersonaGreeting(profile: TraineeProfile, isArabic: boolean, teacherName: TeacherPersonaName): Promise<string> {
+    const persona = TEACHER_PERSONAS[teacherName];
+    const welcomePrompt = isArabic ? persona.welcomePromptAr : persona.welcomePromptEn;
+
+    const prompt = `${welcomePrompt}
+
+Trainee name: ${profile.firstName} ${profile.lastName}
+Sessions completed: ${profile.totalSessions}
+Average score: ${profile.averageScore}%`;
+
+    return this.fallbackProvider.complete({
+      prompt,
+      maxTokens: 300,
+      temperature: 0.7,
+    });
+  }
+
+  /**
+   * Build system prompt for custom teachers from database
+   */
+  private async buildCustomTeacherSystemPrompt(
+    teacherName: string,
+    profileMarkdown: string,
+    lessonContextSection: string,
+    attachmentContext: string,
+    isArabic: boolean
+  ): Promise<string> {
+    // Fetch custom teacher from database
+    const customTeacher = await this.prisma.aITeacher.findFirst({
+      where: { name: teacherName.toLowerCase() },
+      select: {
+        displayNameAr: true,
+        displayNameEn: true,
+        descriptionAr: true,
+        descriptionEn: true,
+        personality: true,
+        systemPromptAr: true,
+        systemPromptEn: true,
+        level: true,
+        brainQueryPrefix: true,
+        contextSource: true,
+      },
+    });
+
+    const displayName = customTeacher?.displayNameEn || customTeacher?.displayNameAr || teacherName;
+
+    const description = customTeacher?.descriptionEn || customTeacher?.descriptionAr || 'AI teacher specialist';
+
+    // Use custom system prompt if available, otherwise generate default
+    let systemPrompt: string;
+
+    if (customTeacher?.systemPromptEn) {
+      // Use custom English system prompt with placeholders
+      systemPrompt = customTeacher.systemPromptEn
+        .replace('{{PROFILE}}', profileMarkdown)
+        .replace('{{NAME}}', displayName);
+    } else if (customTeacher?.systemPromptAr) {
+      // Fallback to Ar field (which should also contain English content now)
+      systemPrompt = customTeacher.systemPromptAr
+        .replace('{{PROFILE}}', profileMarkdown)
+        .replace('{{NAME}}', displayName);
+    } else {
+      // Generate default system prompt - always English
+      systemPrompt = `You are ${displayName} - ${description}.
+
+IMPORTANT: Always respond in English only. Never respond in Arabic.
+
+## Trainee Profile (use this to personalize your responses):
+${profileMarkdown}
+
+## Your Persona:
+- Level: ${customTeacher?.level || 'general'}
+- Personality: ${customTeacher?.personality || 'friendly'}
+
+## Your Rules:
+1. Be warm, professional, and encouraging
+2. Personalize responses based on trainee's strengths and weaknesses
+3. Don't just answer - ask questions to test true comprehension
+4. Focus on practical application in electromechanical engineering
+5. Provide constructive feedback while being supportive
+6. If asked about off-topic subjects, gently redirect to training focus`;
+    }
+
+    // Append lesson context and attachments
+    if (lessonContextSection) {
+      systemPrompt += '\n' + lessonContextSection;
+    }
+    if (attachmentContext) {
+      systemPrompt += '\n' + attachmentContext;
+    }
+
+    return systemPrompt;
+  }
+
+  /**
+   * Generate greeting for custom teachers (from database)
+   */
+  private async generateCustomTeacherGreeting(profile: TraineeProfile, isArabic: boolean, teacherName: string): Promise<string> {
+    // Fetch custom teacher from database
+    const customTeacher = await this.prisma.aITeacher.findFirst({
+      where: { name: teacherName.toLowerCase() },
+      select: {
+        displayNameAr: true,
+        displayNameEn: true,
+        descriptionAr: true,
+        descriptionEn: true,
+        personality: true,
+        systemPromptAr: true,
+        systemPromptEn: true,
+      },
+    });
+
+    const displayName = customTeacher?.displayNameEn || customTeacher?.displayNameAr || teacherName;
+    const description = customTeacher?.descriptionEn || customTeacher?.descriptionAr || '';
+
+    const prompt = `You are ${displayName}, ${description || 'an AI teacher specializing in electromechanical engineering training'}.
+
+Write a short, personalized welcome greeting (2-3 sentences only) for the trainee.
+
+Trainee name: ${profile.firstName} ${profile.lastName}
+Sessions completed: ${profile.totalSessions}
+Average score: ${profile.averageScore}%
+
+Be warm and professional, and introduce yourself by name.`;
+
+    return this.fallbackProvider.complete({
+      prompt,
+      maxTokens: 300,
+      temperature: 0.7,
+    });
+  }
+
+  async sendMessage(traineeId: string, message: string, attachments?: FileAttachment[], lessonContext?: LessonContext, teacherName?: string): Promise<ChatResponse> {
+    // Get profile for context
+    const profile = await this.getOrCreateProfile(traineeId);
+    const profileMarkdown = this.generateProfileMarkdown(profile);
+
+    const isArabic = profile.language === 'ar';
+
+    // Build context from attachments
+    let attachmentContext = '';
+    if (attachments && attachments.length > 0) {
+      attachmentContext = '\n\nAttachments provided by the trainee:\n';
+      for (const attachment of attachments) {
+        if (attachment.extractedText) {
+          attachmentContext += `--- ${attachment.filename} ---\n${attachment.extractedText}\n\n`;
+        }
+      }
+    }
+
+    // Build lesson context section if available
+    let lessonContextSection = '';
+    if (lessonContext) {
+      lessonContextSection = `
+
+## Current Lesson Context (trainee is studying this lesson):
+- **Lesson**: ${lessonContext.lessonName || lessonContext.lessonNameAr}
+- **Description**: ${lessonContext.lessonDescription || lessonContext.lessonDescriptionAr}
+- **Course**: ${lessonContext.courseName || lessonContext.courseNameAr}
+- **Category**: ${lessonContext.courseCategory}
+- **Difficulty**: ${lessonContext.courseDifficulty}
+- **Course Objectives**: ${(lessonContext.courseObjectives || lessonContext.courseObjectivesAr)?.join(', ') || 'Not specified'}
+${lessonContext.videoDurationMinutes ? `- **Video Duration**: ${lessonContext.videoDurationMinutes} minutes` : ''}
+
+🎯 **Lesson-Specific Instructions**:
+- Focus your answers on this specific lesson content
+- Relate your explanations to the course objectives
+- Provide practical examples related to the topic
+- If the trainee asks a general question, try to relate it to the current lesson
+`;
+    }
+
+    // Get available courses context for recommendations
+    const coursesContext = await this.getCoursesContext(traineeId, isArabic);
+
+    // System prompt: use persona-specific if teacherName provided, else generic
+    let systemPrompt: string;
+    if (teacherName) {
+      if (isValidTeacherName(teacherName)) {
+        // Use static persona for built-in teachers
+        systemPrompt = await this.buildPersonaSystemPrompt(
+          traineeId, teacherName as TeacherPersonaName, profileMarkdown,
+          lessonContextSection, attachmentContext, isArabic, message
+        );
+        // Add courses context to persona prompt
+        if (coursesContext) {
+          systemPrompt += '\n\n' + coursesContext;
+        }
+      } else {
+        // Use custom teacher from database
+        systemPrompt = await this.buildCustomTeacherSystemPrompt(
+          teacherName, profileMarkdown, lessonContextSection, attachmentContext, isArabic
+        );
+        // Add courses context to custom teacher prompt
+        if (coursesContext) {
+          systemPrompt += '\n\n' + coursesContext;
+        }
+      }
+    } else {
+      systemPrompt = `You are "AI Teacher" - an AI mentor specializing in electromechanical engineering training.
+
+IMPORTANT: Always respond in English only. Never respond in Arabic.
+
+## Trainee Profile (use this to personalize your responses):
+${profileMarkdown}
+${lessonContextSection}
+
+## Your Rules:
+1. Be warm, professional, and encouraging
+2. Personalize responses based on trainee's strengths and weaknesses
+3. Don't just answer - ask questions to test true comprehension
+4. Focus on practical application in electromechanical engineering
+5. Provide constructive feedback while being supportive
+6. If asked about off-topic subjects, gently redirect to training focus
+7. When asked about suitable courses, recommend based on trainee's level and weaknesses with direct links
+
+## Response Formatting:
+- Write in clear language without ** or markdown symbols
+- When mentioning a link, write it fully on a separate line for easy copying
+- Don't use square brackets [] or strange symbols
+- Use regular bullets for lists
+${attachmentContext}
+${coursesContext}`;
+    }
+
+    // Generate response using Gemini 2.0 Flash for low-latency
+    const response = await this.fallbackProvider.complete({
+      prompt: message,
+      systemPrompt,
+      maxTokens: 800,
+      temperature: 0.7,
+    });
+
+    // Extract any follow-up questions from the response
+    const followUpQuestions = this.extractFollowUpQuestions(response, false);
+
+    // Check if we should add an assessment question
+    let assessmentQuestion = undefined;
+    if (Math.random() < 0.3) { // 30% chance to ask assessment
+      assessmentQuestion = await this.generateAssessmentQuestion(profile, message, isArabic);
+    }
+
+    // Generate audio for response if available
+    let audioBase64: string | undefined;
+    if (this.elevenLabsApiKey) {
+      try {
+        // Only generate audio for shorter responses
+        if (response.length < 500) {
+          audioBase64 = await this.textToSpeech(response, profile.language);
+        }
+      } catch {
+        // Audio generation failed - continue without audio
+      }
+    }
+
+    // Update session with lesson context for learning insights
+    this.updateSession(traineeId, message, response, lessonContext, teacherName);
+
+    return {
+      message: response,
+      audioBase64,
+      followUpQuestions,
+      assessmentQuestion,
+    };
+  }
+
+  /**
+   * Send a message with streaming response for real-time UI updates
+   * Uses Gemini 2.0 Flash streaming API for chunk-by-chunk delivery
+   */
+  async *sendMessageStream(
+    traineeId: string,
+    message: string,
+    attachments?: FileAttachment[],
+    lessonContext?: LessonContext,
+    teacherName?: string
+  ): AsyncGenerator<StreamingChatResponse, void, unknown> {
+    // Get profile for context
+    const profile = await this.getOrCreateProfile(traineeId);
+    const profileMarkdown = this.generateProfileMarkdown(profile);
+
+    const isArabic = profile.language === 'ar';
+
+    // Build context from attachments
+    let attachmentContext = '';
+    if (attachments && attachments.length > 0) {
+      attachmentContext = '\n\nAttachments provided by the trainee:\n';
+      for (const attachment of attachments) {
+        if (attachment.extractedText) {
+          attachmentContext += `--- ${attachment.filename} ---\n${attachment.extractedText}\n\n`;
+        }
+      }
+    }
+
+    // Build lesson context section if available
+    let lessonContextSection = '';
+    if (lessonContext) {
+      lessonContextSection = `\n\n## Current Lesson Context:\n- **Lesson**: ${lessonContext.lessonName || lessonContext.lessonNameAr}\n- **Description**: ${lessonContext.lessonDescription || lessonContext.lessonDescriptionAr}\n- **Course**: ${lessonContext.courseName || lessonContext.courseNameAr}`;
+    }
+
+    // Get available courses context for recommendations
+    const coursesContext = await this.getCoursesContext(traineeId, false);
+
+    // System prompt: use persona-specific if teacherName provided, else generic
+    let systemPrompt: string;
+    if (teacherName) {
+      if (isValidTeacherName(teacherName)) {
+        systemPrompt = await this.buildPersonaSystemPrompt(
+          traineeId, teacherName as TeacherPersonaName, profileMarkdown,
+          lessonContextSection, attachmentContext, isArabic, message
+        );
+        // Add courses context to persona prompt
+        if (coursesContext) {
+          systemPrompt += '\n\n' + coursesContext;
+        }
+      } else {
+        // Custom teacher from database
+        systemPrompt = await this.buildCustomTeacherSystemPrompt(
+          teacherName, profileMarkdown, lessonContextSection, attachmentContext, isArabic
+        );
+        // Add courses context to custom teacher prompt
+        if (coursesContext) {
+          systemPrompt += '\n\n' + coursesContext;
+        }
+      }
+    } else {
+      systemPrompt = `You are "AI Teacher" - an AI mentor specializing in electromechanical engineering training.\n\nIMPORTANT: Always respond in English only. Never respond in Arabic.\n\n## Trainee Profile:\n${profileMarkdown}${lessonContextSection}\n\n## Your Rules:\n1. Be warm, professional, and encouraging\n2. Personalize responses based on trainee's strengths and weaknesses\n3. Don't just answer - ask questions to test comprehension\n4. Focus on practical application in electromechanical engineering\n5. When asked about courses, recommend based on trainee level with direct links\n\n## Response Formatting:\n- Write in clear language without ** or markdown symbols\n- When mentioning a link, write it fully on a separate line for easy copying\n- Don't use square brackets [] or strange symbols${attachmentContext}\n\n${coursesContext}`;
+    }
+
+    let fullMessage = '';
+    let firstSentenceComplete = false;
+    let firstSentence = '';
+    let firstSentenceAudioPromise: Promise<string | undefined> | null = null;
+
+    try {
+      // Stream response using Gemini
+      for await (const chunk of this.fallbackProvider.streamComplete({
+        prompt: message,
+        systemPrompt,
+        maxTokens: 800,
+        temperature: 0.7,
+      })) {
+        fullMessage += chunk;
+
+        // Pre-render audio for first sentence as soon as it's complete
+        if (!firstSentenceComplete && this.elevenLabsApiKey) {
+          const sentenceEndMatch = fullMessage.match(/^(.*?[.!?\n])/);
+          if (sentenceEndMatch && sentenceEndMatch[1].length >= 20) {
+            firstSentenceComplete = true;
+            firstSentence = sentenceEndMatch[1].trim();
+
+            // Start audio generation in background (don't await)
+            firstSentenceAudioPromise = this.textToSpeech(firstSentence, 'en')
+              .catch(() => undefined);
+          }
+        }
+
+        yield {
+          type: 'chunk',
+          content: chunk,
+        };
+      }
+
+      // Extract follow-up questions from full message
+      const followUpQuestions = this.extractFollowUpQuestions(fullMessage, false);
+
+      // Check if we should add an assessment question (20% chance for streaming)
+      let assessmentQuestion = undefined;
+      if (Math.random() < 0.2) {
+        assessmentQuestion = await this.generateAssessmentQuestion(profile, message, false);
+      }
+
+      // Get pre-rendered audio for first sentence, or generate for full message if short
+      let audioBase64: string | undefined;
+      if (firstSentenceAudioPromise) {
+        // Use pre-rendered first sentence audio
+        audioBase64 = await firstSentenceAudioPromise;
+      } else if (this.elevenLabsApiKey && fullMessage.length < 500) {
+        // Fallback: generate audio for the full message if it's short
+        try {
+          audioBase64 = await this.textToSpeech(fullMessage, profile.language);
+        } catch {
+          // Audio generation failed - continue without audio
+        }
+      }
+
+      // Update session
+      this.updateSession(traineeId, message, fullMessage, lessonContext, teacherName);
+
+      // Send final done event with full message and metadata
+      yield {
+        type: 'done',
+        fullMessage,
+        audioBase64,
+        followUpQuestions,
+        assessmentQuestion,
+      };
+    } catch (error) {
+      yield {
+        type: 'error',
+        error: error instanceof Error ? error.message : 'Unknown error occurred',
+      };
+    }
+  }
+
+  private extractFollowUpQuestions(response: string, isArabic: boolean): string[] {
+    // Find questions in the response
+    const questionPattern = isArabic ? /[؟?][^؟?]*/g : /\?[^?]*/g;
+    const questions: string[] = [];
+
+    // Simple extraction - find sentences ending with ?
+    const sentences = response.split(/[.؟?]/);
+    for (const sentence of sentences) {
+      if (sentence.trim().length > 10 && sentence.trim().length < 100) {
+        if (isArabic && response.includes(sentence + '؟')) {
+          questions.push(sentence.trim() + '؟');
+        } else if (!isArabic && response.includes(sentence + '?')) {
+          questions.push(sentence.trim() + '?');
+        }
+      }
+    }
+
+    return questions.slice(0, 2);
+  }
+
+  private async generateAssessmentQuestion(
+    profile: TraineeProfile,
+    topic: string,
+    isArabic: boolean
+  ): Promise<{ question: string; type: 'multiple_choice' | 'open_ended' | 'true_false'; options?: string[] } | undefined> {
+    // Focus on weak areas
+    const weakArea = profile.weaknesses[0] || 'general engineering skills';
+
+    const prompt = `Write a short quiz question about "${weakArea}" in electromechanical engineering.
+
+Choose ONE type:
+1. Multiple choice (4 options)
+2. Short open-ended question
+3. True/false
+
+Answer in JSON only:
+{
+  "question": "question text",
+  "type": "multiple_choice" or "open_ended" or "true_false",
+  "options": ["opt1", "opt2", "opt3", "opt4"] // only for multiple choice
+}`;
+
+    try {
+      const result = await this.fallbackProvider.complete({
+        prompt,
+        maxTokens: 300,
+        temperature: 0.5,
+      });
+
+      // Parse JSON
+      let jsonStr = result;
+      const jsonMatch = result.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[1];
+      }
+
+      const parsed = JSON.parse(jsonStr.trim());
+      return {
+        question: parsed.question,
+        type: parsed.type,
+        options: parsed.options,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private updateSession(traineeId: string, userMessage: string, assistantMessage: string, lessonContext?: LessonContext, teacherName?: string): void {
+    const sessionKey = this.getSessionKey(traineeId, teacherName);
+    let session = this.sessionCache.get(sessionKey);
+
+    if (!session) {
+      session = {
+        id: `session-${traineeId}-${Date.now()}`,
+        traineeId,
+        teacherName,
+        messages: [],
+        startedAt: new Date(),
+        lastMessageAt: new Date(),
+        status: 'active',
+      };
+    }
+
+    session.messages.push(
+      {
+        id: `msg-${Date.now()}-user`,
+        role: 'user',
+        content: userMessage,
+        timestamp: new Date(),
+      },
+      {
+        id: `msg-${Date.now()}-assistant`,
+        role: 'assistant',
+        content: assistantMessage,
+        timestamp: new Date(),
+      }
+    );
+    session.lastMessageAt = new Date();
+
+    // Update topic from lesson context if available
+    if (lessonContext) {
+      session.topic = lessonContext.lessonName;
+    }
+
+    this.sessionCache.set(sessionKey, session);
+
+    // Update trainee profile with learning insights (async, don't wait)
+    this.updateLearningInsights(traineeId, userMessage, assistantMessage, lessonContext).catch(() => {
+      // Learning insights update failed - non-critical
+    });
+  }
+
+  /**
+   * Update trainee profile with learning insights based on AI Teacher interactions
+   */
+  private async updateLearningInsights(
+    traineeId: string,
+    userMessage: string,
+    assistantMessage: string,
+    lessonContext?: LessonContext
+  ): Promise<void> {
+    try {
+      const profile = await this.getOrCreateProfile(traineeId);
+
+      // Track recently studied topics
+      if (lessonContext) {
+        const topicName = lessonContext.lessonName || lessonContext.lessonNameAr;
+        if (!profile.recentTopics.includes(topicName)) {
+          profile.recentTopics = [topicName, ...profile.recentTopics].slice(0, 5);
+        }
+      }
+
+      // Increment total sessions (approximately - one per conversation)
+      const session = this.sessionCache.get(traineeId);
+      if (session && session.messages.length === 2) {
+        // Only count first message exchange as a "session start"
+        profile.totalSessions += 1;
+      }
+
+      // Update last active
+      profile.lastActiveAt = new Date();
+
+      // Save updated profile
+      await this.saveProfile(profile);
+
+      // Update trainee record in database
+      await this.prisma.trainee.update({
+        where: { id: traineeId },
+        data: {
+          lastActiveAt: new Date(),
+        },
+      });
+
+      // Generate and save session note after every 5th message or when lesson context changes
+      const shouldGenerateNote = session && (
+        session.messages.length % 10 === 0 || // Every 5 exchanges (10 messages)
+        (lessonContext && session.messages.length === 2) // First exchange with lesson context
+      );
+
+      if (shouldGenerateNote) {
+        this.generateAndSaveSessionNote(traineeId, session, profile.language, lessonContext).catch(() => {
+          // Non-critical - session note generation can fail silently
+        });
+      }
+    } catch {
+      // Non-critical - learning insights update can fail silently
+    }
+  }
+
+  /**
+   * Generate a session note using AI to summarize the learning insights
+   */
+  private async generateAndSaveSessionNote(
+    traineeId: string,
+    session: TeacherSession,
+    language: 'ar' | 'en',
+    lessonContext?: LessonContext
+  ): Promise<void> {
+    const isArabic = language === 'ar';
+
+    // Get last few messages for context
+    const recentMessages = session.messages.slice(-6).map(m => `${m.role}: ${m.content}`).join('\n\n');
+
+    const prompt = `Based on this educational conversation, create a brief summary in JSON format:
+
+Conversation:
+${recentMessages}
+
+${lessonContext ? `Lesson: ${lessonContext.lessonName}` : ''}
+
+Respond in JSON only:
+{
+  "summary": "Brief summary of the conversation (1-2 sentences)",
+  "insightsGained": ["insight the trainee learned 1", "insight 2"],
+  "areasToReview": ["topic that needs review"]
+}`;
+
+    try {
+      const result = await this.fallbackProvider.complete({
+        prompt,
+        maxTokens: 500,
+        temperature: 0.3,
+      });
+
+      // Parse JSON
+      let jsonStr = result;
+      const jsonMatch = result.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[1];
+      }
+
+      const parsed = JSON.parse(jsonStr.trim());
+
+      const note: SessionNote = {
+        timestamp: new Date().toISOString().split('T')[0], // YYYY-MM-DD
+        topic: lessonContext
+          ? (lessonContext.lessonName || lessonContext.lessonNameAr)
+          : 'General Conversation',
+        summary: parsed.summary || '',
+        insightsGained: parsed.insightsGained || [],
+        areasToReview: parsed.areasToReview || [],
+      };
+
+      await this.addSessionNote(traineeId, note);
+    } catch {
+      // Session note generation failed - non-critical
+    }
+  }
+
+  async getAssignedTeacher(traineeId: string): Promise<{ assignedTeacher: string | null; assignedTeacherAt: Date | null }> {
+    const trainee = await this.prisma.trainee.findUnique({
+      where: { id: traineeId },
+      select: { assignedTeacher: true, assignedTeacherAt: true },
+    });
+    return {
+      assignedTeacher: trainee?.assignedTeacher || null,
+      assignedTeacherAt: trainee?.assignedTeacherAt || null,
+    };
+  }
+
+  async getSessionHistory(traineeId: string, limit: number = 10, teacherName?: string): Promise<TeacherSession[]> {
+    // For now, return from cache
+    // In production, this would query the database
+    const sessionKey = this.getSessionKey(traineeId, teacherName);
+    const session = this.sessionCache.get(sessionKey);
+    return session ? [session] : [];
+  }
+
+  // ============================================================================
+  // VOICE SYNTHESIS
+  // ============================================================================
+
+  /**
+   * Convert text to speech using ElevenLabs
+   * @param text - Text to convert
+   * @param language - Language code ('ar' or 'en')
+   * @param teacherName - Optional teacher name for persona-specific voice
+   */
+  async textToSpeech(text: string, language: 'ar' | 'en', teacherName?: string, directVoiceId?: string, organizationId?: string): Promise<string> {
+    if (!this.elevenLabsApiKey) {
+      throw new Error('ElevenLabs API key not configured');
+    }
+
+    // Get voice ID - PRIORITY: direct voiceId (for preview), then database, then static config, then language default
+    let voiceId: string;
+
+    // If directVoiceId is provided (e.g., for admin preview before saving), use it directly
+    if (directVoiceId) {
+      voiceId = directVoiceId;
+    } else if (teacherName) {
+      // First, check database for custom voiceId (allows admin to override any teacher's voice)
+      // IMPORTANT: Use organizationId to get the correct teacher for this user's organization
+      const teacherFromDb = await this.prisma.aITeacher.findFirst({
+        where: {
+          name: teacherName.toLowerCase(),
+          ...(organizationId && { organizationId }),
+        },
+        select: { voiceId: true },
+      });
+
+      if (teacherFromDb?.voiceId) {
+        // Database voiceId takes priority (admin can customize)
+        voiceId = teacherFromDb.voiceId;
+      } else if (isStaticTeacher(teacherName)) {
+        // Fallback to static config for built-in teachers
+        voiceId = getTeacherVoiceId(teacherName);
+      } else {
+        // Ultimate fallback to language default
+        voiceId = VOICE_IDS[language];
+      }
+    } else {
+      voiceId = VOICE_IDS[language];
+    }
+
+    // Use eleven_turbo_v2_5 for English (fast + good quality)
+    const modelId = 'eleven_turbo_v2_5';
+
+    // AbortController for 30-second timeout
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+
+    try {
+      const response = await fetch(`${ELEVENLABS_API_BASE}/text-to-speech/${voiceId}`, {
+        method: 'POST',
+        headers: {
+          'xi-api-key': this.elevenLabsApiKey,
+          'Content-Type': 'application/json',
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          text,
+          model_id: modelId,
+          voice_settings: {
+            stability: 0.7,          // Higher stability = consistent speed & tone
+            similarity_boost: 0.75,  // Good voice fidelity
+            style: 0.15,             // Low style variation for consistency
+            use_speaker_boost: true,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        const error = await response.text();
+        throw new Error(`ElevenLabs TTS failed: ${response.status} - ${error}`);
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      return Buffer.from(arrayBuffer).toString('base64');
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Generate welcome message audio for a teacher persona
+   * Uses pre-defined welcome messages from config for static teachers,
+   * or fetches from database for custom teachers
+   */
+  async generateWelcomeAudio(teacherName: string, language: 'ar' | 'en', organizationId?: string): Promise<{
+    message: string;
+    audio: string;
+  }> {
+    let welcomeMessage: string;
+
+    // PRIORITY: Check database first (allows admin to customize any teacher's welcome message)
+    // IMPORTANT: Use organizationId to get the correct teacher for this user's organization
+    const customTeacher = await this.prisma.aITeacher.findFirst({
+      where: {
+        name: teacherName.toLowerCase(),
+        ...(organizationId && { organizationId }),
+      },
+      select: {
+        welcomeMessageAr: true,
+        welcomeMessageEn: true,
+        displayNameAr: true,
+        displayNameEn: true,
+      },
+    });
+
+    if (customTeacher) {
+      const dbWelcome = customTeacher.welcomeMessageEn || customTeacher.welcomeMessageAr;
+
+      if (dbWelcome) {
+        // Use database welcome message (admin customized)
+        welcomeMessage = dbWelcome;
+      } else if (isStaticTeacher(teacherName)) {
+        // Fallback to static config for built-in teachers
+        welcomeMessage = getTeacherWelcome(teacherName, 'en');
+      } else {
+        // Fallback for custom teachers without welcome message
+        const displayName = customTeacher.displayNameEn || customTeacher.displayNameAr;
+        welcomeMessage = `Welcome! I'm ${displayName}, how can I help you today?`;
+      }
+    } else if (isStaticTeacher(teacherName)) {
+      // Teacher not in database but is a static teacher - use static config
+      welcomeMessage = getTeacherWelcome(teacherName, 'en');
+    } else {
+      // Fallback to generic welcome
+      welcomeMessage = `Welcome! How can I help you today?`;
+    }
+
+    const audio = await this.textToSpeech(welcomeMessage, language, teacherName, undefined, organizationId);
+    return { message: welcomeMessage, audio };
+  }
+
+  async speechToText(audioBuffer: Buffer, language: 'ar' | 'en'): Promise<string> {
+    // Use Google Gemini API for speech-to-text
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+
+    if (!geminiApiKey) {
+      throw new Error('Speech-to-text service not configured. Please add GEMINI_API_KEY to .env file.');
+    }
+
+    // Convert audio buffer to base64
+    const audioBase64 = audioBuffer.toString('base64');
+
+    // Use Gemini's multimodal capabilities to transcribe audio (stable model version)
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key=${geminiApiKey}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            {
+              text: 'Transcribe this audio file to text. Return only the spoken text without any comments or explanation.'
+            },
+            {
+              inline_data: {
+                mime_type: 'audio/webm',
+                data: audioBase64
+              }
+            }
+          ]
+        }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 1000,
+        }
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+
+      // Check for rate limit errors
+      if (response.status === 429 || error.includes('RESOURCE_EXHAUSTED') || error.includes('quota')) {
+        throw new Error('Rate limit exceeded. Please try again in a minute.');
+      }
+
+      throw new Error(`Speech-to-text failed: ${response.status} - ${error}`);
+    }
+
+    const result = await response.json() as {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{ text?: string }>;
+        };
+      }>;
+      error?: { message: string };
+    };
+
+    // Check for error in response body
+    if (result.error) {
+      throw new Error(result.error.message);
+    }
+
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    return text.trim();
+  }
+
+  // ============================================================================
+  // FILE PROCESSING
+  // ============================================================================
+
+  async processUploadedFile(file: Buffer, filename: string, mimeType: string): Promise<FileAttachment> {
+    let extractedText = '';
+
+    // Extract text based on file type
+    if (mimeType === 'application/pdf') {
+      extractedText = await this.extractPdfText(file);
+    } else if (mimeType.includes('text/') || mimeType === 'application/json') {
+      extractedText = file.toString('utf-8');
+    } else if (mimeType.includes('word') || mimeType.includes('document')) {
+      // For Word docs, note it was uploaded (would need mammoth library for full extraction)
+      extractedText = '[Word document uploaded - content will be analyzed by the AI Teacher]';
+    } else if (mimeType.startsWith('image/')) {
+      // Use Gemini's multimodal capabilities to describe the image
+      extractedText = await this.extractImageContent(file, mimeType);
+    } else if (mimeType.includes('powerpoint') || mimeType.includes('presentation')) {
+      // Note PowerPoint upload - Gemini can potentially analyze if converted
+      extractedText = '[PowerPoint presentation uploaded - slides will be analyzed for educational content]';
+    }
+
+    return {
+      id: `file-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      filename,
+      mimeType,
+      size: file.length,
+      extractedText: extractedText.slice(0, 15000), // Limit extracted text
+    };
+  }
+
+  /**
+   * Extract content description from images using Gemini's multimodal capabilities
+   */
+  private async extractImageContent(imageBuffer: Buffer, mimeType: string): Promise<string> {
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+
+    if (!geminiApiKey) {
+      return '[Image uploaded - visual analysis not available without Gemini API key]';
+    }
+
+    try {
+      const imageBase64 = imageBuffer.toString('base64');
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiApiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                {
+                  text: `Analyze this image in the context of electromechanical engineering training. Describe:
+1. What the image shows (equipment, schematic, diagram, etc.)
+2. Key details relevant to electromechanical engineering (specifications, components, layout)
+3. Any text visible in the image
+4. How this could be used for training purposes
+
+Respond in both Arabic and English. Be concise but informative.`
+                },
+                {
+                  inline_data: {
+                    mime_type: mimeType,
+                    data: imageBase64
+                  }
+                }
+              ]
+            }],
+            generationConfig: {
+              temperature: 0.3,
+              maxOutputTokens: 1000,
+            }
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        return '[Image uploaded - could not analyze image content]';
+      }
+
+      const result = await response.json() as {
+        candidates?: Array<{
+          content?: {
+            parts?: Array<{ text?: string }>;
+          };
+        }>;
+      };
+
+      const description = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      return description || '[Image uploaded - no description available]';
+    } catch {
+      return '[Image uploaded - error analyzing image]';
+    }
+  }
+
+  private async extractPdfText(buffer: Buffer): Promise<string> {
+    try {
+      // Convert Buffer to Uint8Array (required by pdf-parse v2)
+      const uint8Array = new Uint8Array(buffer);
+
+      // Use pdf-parse library for proper PDF text extraction
+      const parser = new PDFParse(uint8Array);
+      await parser.load();
+      const result = await parser.getText();
+
+      // Extract text from all pages
+      const pageTexts = result.pages.map((page: { text: string; num: number }) => page.text).filter((t: string) => t.trim().length > 0);
+      const fullText = pageTexts.join('\n\n');
+
+      // Clean up the parser
+      parser.destroy();
+
+      if (fullText.trim().length > 0) {
+        // Clean up the text - remove excessive whitespace
+        const cleanedText = fullText
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 15000); // Limit to 15k chars to avoid overwhelming the LLM
+
+        return cleanedText;
+      }
+
+      return '[PDF has no readable text - it appears to be a scanned image without a text layer. Please upload a PDF with selectable text.]';
+    } catch {
+      return '[Text extraction failed. The file may be encrypted or corrupted.]';
+    }
+  }
+
+  // ============================================================================
+  // GEMINI-POWERED EDUCATIONAL CONTENT GENERATION
+  // ============================================================================
+
+  /**
+   * Generate an educational summary for a lesson using Gemini
+   */
+  async generateLessonSummary(lessonContext: LessonContext, language: 'ar' | 'en'): Promise<{
+    summary: string;
+    keyPoints: string[];
+    practicalTips: string[];
+  }> {
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+
+    if (!geminiApiKey) {
+      throw new Error('GEMINI_API_KEY not configured');
+    }
+
+    // Validate lesson context
+    if (!lessonContext) {
+      throw new Error('Lesson context is required');
+    }
+
+    const lessonName = lessonContext.lessonName || lessonContext.lessonNameAr || 'Unknown Lesson';
+    const lessonDescription = lessonContext.lessonDescription || lessonContext.lessonDescriptionAr || '';
+    const courseName = lessonContext.courseName || lessonContext.courseNameAr || 'Unknown Course';
+    const objectives = lessonContext.courseObjectives || lessonContext.courseObjectivesAr || [];
+
+    const prompt = `You are an electromechanical engineering training expert. Create an educational summary for the following lesson:
+
+Lesson: ${lessonName}
+Description: ${lessonDescription}
+Course: ${courseName}
+Objectives: ${objectives?.join(', ') || 'Not specified'}
+
+Respond in JSON format only:
+{
+  "summary": "Comprehensive summary of the lesson in 2-3 paragraphs",
+  "keyPoints": ["Key point 1", "Key point 2", "Key point 3", "Key point 4", "Key point 5"],
+  "practicalTips": ["Practical tip 1", "Practical tip 2", "Practical tip 3"]
+}
+
+Focus on practical application in the Saudi market.`;
+
+    try {
+      // Use gemini-2.0-flash-001 (stable)
+      const modelName = 'gemini-2.0-flash-001';
+
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiApiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 1500 }
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
+      }
+
+      const result = await response.json() as {
+        candidates?: Array<{
+          content?: {
+            parts?: Array<{ text?: string }>;
+          };
+        }>;
+        error?: { message: string };
+      };
+
+      // Check for API error in response body
+      if (result.error) {
+        throw new Error(result.error.message);
+      }
+
+      const text = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+      if (!text) {
+        throw new Error('Empty response from Gemini API');
+      }
+
+      // Extract JSON from response
+      let jsonStr = text;
+      const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[1];
+      }
+
+      // Try to find JSON object in the text if not wrapped in code blocks
+      if (!jsonMatch) {
+        const jsonObjectMatch = text.match(/\{[\s\S]*\}/);
+        if (jsonObjectMatch) {
+          jsonStr = jsonObjectMatch[0];
+        }
+      }
+
+      const parsed = JSON.parse(jsonStr.trim());
+      return {
+        summary: parsed.summary || '',
+        keyPoints: parsed.keyPoints || [],
+        practicalTips: parsed.practicalTips || [],
+      };
+    } catch (error: any) {
+
+      // Check for rate limit errors
+      const errorMessage = error?.message || '';
+      const isRateLimitError = errorMessage.includes('429') || errorMessage.includes('quota') || errorMessage.includes('RESOURCE_EXHAUSTED');
+
+      if (isRateLimitError) {
+        return {
+          summary: '⚠️ Free tier API quota exceeded. Please try again in a minute.',
+          keyPoints: [],
+          practicalTips: [],
+        };
+      }
+
+      return {
+        summary: 'Could not generate summary. Please try again.',
+        keyPoints: [],
+        practicalTips: [],
+      };
+    }
+  }
+
+  /**
+   * Generate a mini-quiz for the current lesson using Gemini
+   */
+  async generateMiniQuiz(lessonContext: LessonContext, language: 'ar' | 'en', numQuestions: number = 3): Promise<{
+    questions: Array<{
+      id: string;
+      question: string;
+      type: 'multiple_choice' | 'true_false';
+      options?: string[];
+      correctAnswer: string;
+      explanation: string;
+    }>;
+  }> {
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+
+    if (!geminiApiKey) {
+      throw new Error('GEMINI_API_KEY not configured');
+    }
+
+    // Validate lesson context
+    if (!lessonContext) {
+      throw new Error('Lesson context is required');
+    }
+
+    const lessonName = lessonContext.lessonName || lessonContext.lessonNameAr || 'Unknown Lesson';
+    const lessonDescription = lessonContext.lessonDescription || lessonContext.lessonDescriptionAr || '';
+    const courseName = lessonContext.courseName || lessonContext.courseNameAr || 'Unknown Course';
+
+    const prompt = `You are an electromechanical engineering training expert. Create ${numQuestions} short quiz questions for the following lesson:
+
+Lesson: ${lessonName}
+Description: ${lessonDescription}
+Course: ${courseName}
+
+Respond in JSON format only:
+{
+  "questions": [
+    {
+      "id": "q1",
+      "question": "Question text",
+      "type": "multiple_choice",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correctAnswer": "Option A",
+      "explanation": "Explanation of why this answer is correct"
+    }
+  ]
+}
+
+Mix between multiple choice (4 options) and true/false questions. Focus on practical concepts.`;
+
+    try {
+      // Use stable model version
+      const modelName = 'gemini-2.0-flash-001';
+
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiApiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 2000 }
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
+      }
+
+      const result = await response.json() as {
+        candidates?: Array<{
+          content?: {
+            parts?: Array<{ text?: string }>;
+          };
+        }>;
+        error?: { message: string };
+      };
+
+      // Check for API error in response body
+      if (result.error) {
+        throw new Error(result.error.message);
+      }
+
+      const text = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+      if (!text) {
+        throw new Error('Empty response from Gemini API for quiz');
+      }
+
+      // Extract JSON from response
+      let jsonStr = text;
+      const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[1];
+      }
+
+      // Try to find JSON object in the text if not wrapped in code blocks
+      if (!jsonMatch) {
+        const jsonObjectMatch = text.match(/\{[\s\S]*\}/);
+        if (jsonObjectMatch) {
+          jsonStr = jsonObjectMatch[0];
+        }
+      }
+
+      const parsed = JSON.parse(jsonStr.trim());
+      return {
+        questions: parsed.questions || [],
+      };
+    } catch (error: any) {
+
+      // Check for rate limit errors and propagate them for better user feedback
+      const errorMessage = error?.message || '';
+      const isRateLimitError = errorMessage.includes('429') || errorMessage.includes('quota') || errorMessage.includes('RESOURCE_EXHAUSTED');
+
+      if (isRateLimitError) {
+        throw new Error('Free tier quota exceeded. Please try again in a minute.');
+      }
+
+      return { questions: [] };
+    }
+  }
+
+  /**
+   * Generate video timestamp recommendations based on a question
+   */
+  async generateVideoTimestamps(
+    lessonContext: LessonContext,
+    question: string,
+    language: 'ar' | 'en'
+  ): Promise<{
+    timestamps: Array<{
+      startTime: string;
+      endTime: string;
+      description: string;
+      relevance: 'high' | 'medium' | 'low';
+    }>;
+  }> {
+    // This would ideally work with video transcripts
+    // For now, return a placeholder suggesting key sections
+    const isArabic = language === 'ar';
+
+    if (!lessonContext.videoDurationMinutes) {
+      return { timestamps: [] };
+    }
+
+    const duration = lessonContext.videoDurationMinutes;
+
+    // Generate approximate timestamps based on video duration
+    const timestamps = [
+      {
+        startTime: '0:00',
+        endTime: `${Math.floor(duration * 0.15)}:00`,
+        description: 'Lesson introduction and basic concepts',
+        relevance: 'high' as const,
+      },
+      {
+        startTime: `${Math.floor(duration * 0.3)}:00`,
+        endTime: `${Math.floor(duration * 0.6)}:00`,
+        description: 'Main content and details',
+        relevance: 'high' as const,
+      },
+      {
+        startTime: `${Math.floor(duration * 0.8)}:00`,
+        endTime: `${duration}:00`,
+        description: 'Summary and key points',
+        relevance: 'medium' as const,
+      },
+    ];
+
+    return { timestamps };
+  }
+
+  // ============================================================================
+  // AUDIO-ONLY SUMMARY
+  // ============================================================================
+
+  /**
+   * Generate a simple audio-only summary (no slides, no video)
+   * Returns text content and audio base64 for direct chat playback
+   */
+  async generateAudioSummary(
+    traineeId: string,
+    topic: string,
+    focusAreas: string[],
+    language: 'ar' | 'en',
+    organizationId?: string
+  ): Promise<{
+    title: string;
+    text: string;
+    audioBase64: string;
+    durationSeconds: number;
+  }> {
+    // Get trainee profile for personalization
+    const profile = await this.getOrCreateProfile(traineeId);
+
+    // Combine focus areas with trainee weaknesses
+    const allFocusAreas = [
+      ...focusAreas,
+      ...profile.weaknesses,
+    ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 5);
+
+    // Get trainee name for personalization
+    const traineeName = profile.firstName || '';
+
+    // Generate summary text using Gemini - always English
+    const prompt = `You are an electromechanical engineering expert named "Alex". Create a brief audio summary (1-2 minutes) about "${topic}" for trainee "${traineeName}".
+
+${allFocusAreas.length > 0 ? `Focus on these important points for the trainee: ${allFocusAreas.join(', ')}` : ''}
+
+The summary should be:
+1. Direct and practical - start with the content immediately
+2. Include actionable tips
+3. Conversational style
+4. Reference industry standards where applicable
+5. Do not use any variables or square brackets - mention the trainee name "${traineeName}" directly if you want to address them
+
+IMPORTANT: Reply with the spoken text only, no formatting, headers, asterisks or markdown - just the text that will be read aloud.`;
+
+    let summaryText = '';
+    try {
+      summaryText = await this.fallbackProvider.complete({
+        prompt,
+        maxTokens: 500,
+        temperature: 0.7,
+      });
+    } catch (error) {
+      console.error('[AITeacherService] Failed to generate summary text:', error);
+      summaryText = `Here's a quick summary about ${topic}. This topic is very important in electromechanical engineering. We recommend diving deeper through the courses available on the platform.`;
+    }
+
+    // Clean up the text
+    summaryText = summaryText.trim();
+
+    // Generate audio using ElevenLabs
+    let audioBase64 = '';
+    let durationSeconds = 0;
+
+    if (this.elevenLabsApiKey && summaryText.length > 0) {
+      try {
+        audioBase64 = await this.textToSpeech(summaryText, language, undefined, undefined, organizationId);
+        // Estimate duration: ~150 words per minute for Arabic, ~180 for English
+        const wordCount = summaryText.split(/\s+/).length;
+        durationSeconds = Math.round((wordCount / 180) * 60);
+      } catch (error) {
+        console.error('[AITeacherService] Failed to generate audio:', error);
+      }
+    }
+
+    const title = `Audio Summary: ${topic}`;
+
+    return {
+      title,
+      text: summaryText,
+      audioBase64,
+      durationSeconds: durationSeconds || 60, // Default 1 minute if calculation fails
+    };
+  }
+
+  // ============================================================================
+  // TEACHER INFO
+  // ============================================================================
+
+  /**
+   * Get teacher info by name (avatar, displayName, voiceId, etc)
+   * Used by frontend to display teacher info dynamically
+   * Priority: database first, then static config fallback
+   */
+  async getTeacherInfo(teacherName: string, organizationId?: string): Promise<{
+    name: string;
+    displayNameAr: string;
+    displayNameEn: string;
+    descriptionAr: string;
+    descriptionEn: string;
+    avatarUrl: string | null;
+    voiceId: string | null;
+    personality: string | null;
+    level: string | null;
+  } | null> {
+    // First, try to find in database
+    const dbTeacher = await this.prisma.aITeacher.findFirst({
+      where: {
+        name: teacherName.toLowerCase(),
+        ...(organizationId && { organizationId }),
+      },
+      select: {
+        name: true,
+        displayNameAr: true,
+        displayNameEn: true,
+        descriptionAr: true,
+        descriptionEn: true,
+        avatarUrl: true,
+        voiceId: true,
+        personality: true,
+        level: true,
+      },
+    });
+
+    if (dbTeacher) {
+      return {
+        name: dbTeacher.name,
+        displayNameAr: dbTeacher.displayNameAr || dbTeacher.name,
+        displayNameEn: dbTeacher.displayNameEn || dbTeacher.name,
+        descriptionAr: dbTeacher.descriptionAr || '',
+        descriptionEn: dbTeacher.descriptionEn || '',
+        avatarUrl: dbTeacher.avatarUrl,
+        voiceId: dbTeacher.voiceId,
+        personality: dbTeacher.personality,
+        level: dbTeacher.level,
+      };
+    }
+
+    // Fallback to static config for built-in teachers
+    if (isStaticTeacher(teacherName)) {
+      const voiceConfig = getTeacherVoiceId(teacherName);
+      const persona = isValidTeacherName(teacherName) ? TEACHER_PERSONAS[teacherName] : null;
+
+      return {
+        name: teacherName,
+        displayNameAr: persona?.displayName.ar || teacherName,
+        displayNameEn: persona?.displayName.en || teacherName,
+        descriptionAr: '',
+        descriptionEn: '',
+        avatarUrl: `https://estateiq-app.vercel.app/avatars/${teacherName}.png`,
+        voiceId: voiceConfig,
+        personality: null,
+        level: null,
+      };
+    }
+
+    return null;
+  }
+}

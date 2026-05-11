@@ -1,0 +1,14 @@
+.git
+.git/
+node_modules
+node_modules/
+dist
+dist/
+data
+data/
+scripts
+scripts/
+*.md
+estateiq-backup.sql
+.env
+.env.*
