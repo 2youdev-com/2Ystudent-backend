@@ -7,8 +7,8 @@ let cachedApp: any = null;
 async function getApp() {
   if (cachedApp) return cachedApp;
 
-  await import('../src/container');
-  const { app } = await import('../src/app');
+  require('../src/container');
+  const { app } = require('../src/app') as typeof import('../src/app');
   cachedApp = app;
   return app;
 }
