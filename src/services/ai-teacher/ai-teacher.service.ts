@@ -10,8 +10,6 @@ import { injectable, inject } from 'tsyringe';
 import { PrismaClient } from '@prisma/client';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const { PDFParse } = require('pdf-parse');
 import {
   IAITeacherService,
   TraineeProfile,
@@ -2076,6 +2074,8 @@ Respond in both Arabic and English. Be concise but informative.`
 
   private async extractPdfText(buffer: Buffer): Promise<string> {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { PDFParse } = require('pdf-parse');
       // Convert Buffer to Uint8Array (required by pdf-parse v2)
       const uint8Array = new Uint8Array(buffer);
 

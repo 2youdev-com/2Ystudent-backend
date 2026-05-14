@@ -1,6 +1,3 @@
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const { PDFParse } = require('pdf-parse');
-
 /**
  * Document Parser — Extracts text from PDF, DOCX, and TXT files.
  * Operates on in-memory buffers (from multer memoryStorage).
@@ -46,6 +43,8 @@ export async function parseDocument(buffer: Buffer, mimeType: string): Promise<P
 }
 
 async function parsePDF(buffer: Buffer): Promise<ParsedDocument> {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { PDFParse } = require('pdf-parse');
   const uint8Array = new Uint8Array(buffer);
   const parser = new PDFParse(uint8Array);
   await parser.load();
