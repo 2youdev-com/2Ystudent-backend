@@ -1,10 +1,9 @@
 import 'reflect-metadata';
-import './container';
+import { container } from './container';
 import express, { Application, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
-import { container } from 'tsyringe';
 
 // Import controllers
 import { SimulationController } from './controllers/simulation.controller';
