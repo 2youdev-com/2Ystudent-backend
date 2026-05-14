@@ -1,7 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
-  "buildCommand": "npx prisma generate",
+  "buildCommand": "npx prisma generate && npx prisma db push --accept-data-loss --skip-generate && npx ts-node prisma/seed-super-admin.ts && npx ts-node prisma/seed.ts",
   "installCommand": "npm install --include=dev",
   "functions": {
     "api/index.ts": {
