@@ -1,26 +1,16 @@
 import 'reflect-metadata';
 import type { Request, Response } from 'express';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import '../src/container.js';
+import { app } from '../src/app.js';
 
-let cachedApp: any = null;
-
-async function getApp() {
-  if (cachedApp) return cachedApp;
-
-  require('../src/container');
-  const { app } = require('../src/app') as typeof import('../src/app');
-  cachedApp = app;
-  return app;
-}
-
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    const app = await getApp();
     return app(req as unknown as Request, res as unknown as Response);
   } catch (err: any) {
-    console.error('[Vercel Handler] Bootstrap failed:', err);
+    console.error('[Vercel Handler] Request failed:', err);
     res.status(500).json({
-      error: 'Bootstrap failed',
+      error: 'Request failed',
       message: err?.message ?? 'Unknown error',
     });
   }

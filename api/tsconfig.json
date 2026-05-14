@@ -5,5 +5,6 @@
     "outDir": "../dist-api",
     "noEmit": true
   },
-  "include": ["**/*.ts", "../src/**/*.ts"]
+  "include": ["**/*.ts", "../src/**/*.ts"],
+  "exclude": ["../node_modules", "../dist", "../tests"]
 }
