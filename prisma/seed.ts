@@ -221,8 +221,8 @@ async function main() {
     create: {
       id: 'admin-macsoft',
       email: 'admin@macsoft.com',
-      firstName: 'Admin',
-      lastName: 'User',
+      firstName: 'James',
+      lastName: 'Miller',
       organizationId: macsoftOrg.id,
       currentLevelId: level.id,
       passwordHash: defaultPassword,
@@ -232,11 +232,49 @@ async function main() {
   });
   console.log('Created admin user:', adminUser.email);
 
+  const supervisorUser = await prisma.trainee.upsert({
+    where: { email: 'abdullah@macsoft.com' },
+    update: {
+      role: 'supervisor',
+      passwordHash: defaultPassword,
+    },
+    create: {
+      email: 'abdullah@macsoft.com',
+      firstName: 'Daniel',
+      lastName: 'Roberts',
+      organizationId: macsoftOrg.id,
+      passwordHash: defaultPassword,
+      status: 'active',
+      role: 'supervisor',
+    },
+  });
+  console.log('Created supervisor user:', supervisorUser.email);
+
+  const learnerUser = await prisma.trainee.upsert({
+    where: { email: 'fahad@macsoft.com' },
+    update: {
+      role: 'student',
+      passwordHash: defaultPassword,
+    },
+    create: {
+      email: 'fahad@macsoft.com',
+      firstName: 'Ryan',
+      lastName: 'Cooper',
+      organizationId: macsoftOrg.id,
+      currentLevelId: level.id,
+      passwordHash: defaultPassword,
+      status: 'active',
+      role: 'student',
+    },
+  });
+  console.log('Created learner user:', learnerUser.email);
+
   console.log('\n========================================');
   console.log('Seeding completed!');
   console.log('========================================');
-  console.log('Admin account: admin@macsoft.com / Test1234');
-  console.log('Add your own users and data manually.');
+  console.log('Admin:      admin@macsoft.com     / Test1234');
+  console.log('Supervisor: abdullah@macsoft.com  / Test1234');
+  console.log('Learner:    fahad@macsoft.com     / Test1234');
   console.log('========================================');
 }
 
